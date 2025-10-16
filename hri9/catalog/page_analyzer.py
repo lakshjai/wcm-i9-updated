@@ -57,21 +57,59 @@ Analyze this document page and provide a detailed analysis in the following JSON
     "image_quality": "high|medium|low",
     "language": "en|es|other",
     "form_version": "version if applicable",
-    "security_features": ["watermark", "hologram", "seal", "etc."]
+    "security_features": ["watermark", "hologram", "seal", "etc."],
+    "text_extraction_method": "text|ocr|hybrid"
   }
 }
 
-IMPORTANT GUIDELINES:
-1. Focus on accuracy and completeness
-2. For I-9 forms, identify the specific version (e.g., "Rev. 08/01/23") and extract all relevant fields
-3. For identity documents, extract key identifying information and validity dates
-4. Use high confidence (0.8+) only when you're very certain about classifications
-5. Include all visible text regions with their purpose and confidence
-6. Identify security features like watermarks, seals, or special formatting
-7. Note handwritten text, signatures, and image quality issues
-8. Extract dates in MM/DD/YYYY format when possible
-9. For employment records, focus on employee identification and job-related data
-10. Use "other" classifications when documents don't fit standard categories
+CRITICAL ACCURACY REQUIREMENTS:
+
+**DATES - EXTREME CARE REQUIRED:**
+1. Extract ALL dates in strict MM/DD/YYYY format (e.g., "02/15/2023" NOT "12/15/2023")
+2. For HANDWRITTEN dates, examine each digit carefully:
+   - "0" vs "1": Look at the shape - "0" is round/oval, "1" is straight/vertical
+   - "2" vs "7": "2" has horizontal base, "7" has diagonal stroke
+   - Double-check month values are 01-12, days are 01-31
+3. If a date is unclear, set confidence to 0.6 or lower and include in metadata
+4. NEVER guess dates - if uncertain, use null and note in page_metadata
+
+**DOCUMENT TITLES - VERBATIM EXTRACTION:**
+5. Extract document titles EXACTLY as written - do not paraphrase or summarize
+6. Include ALL components mentioned (e.g., "EAD issued by DHS form DS-2019 with I-94 and letter from exchange program")
+7. Preserve exact wording, capitalization, and punctuation from the original
+8. For multi-part documents, list ALL parts separated by "with" or "and"
+9. **CRITICAL for handwritten document titles**:
+   - Look at the IMAGE carefully, not just OCR text
+   - Common handwriting patterns: "issued by DHS" NOT "by itself"
+   - Look for "I-94" which is often missed or misread
+   - "EAD" = Employment Authorization Document
+   - Read each word carefully: "issued", "by", "DHS", "with", "I-94"
+   - If text is unclear, examine the image more closely before guessing
+
+**SECTION 2 & 3 HANDLING:**
+9. When a page contains BOTH Section 2 and Section 3:
+   - Extract Section 2 data (List A/B/C documents) if fields are filled
+   - Extract Section 3 data (reverification) if fields are filled
+   - Skip sections where ALL fields are empty/blank
+   - Use field prefixes: "section_2_" for Section 2, "reverification_" for Section 3
+
+**FIELD VALIDATION:**
+10. Only extract fields that have actual values - skip empty/blank fields
+11. Use "N/A" only when explicitly written on the form
+12. Use null for truly empty fields
+13. Validate extracted data makes logical sense (e.g., expiration dates are future dates)
+
+**QUALITY INDICATORS:**
+14. Set confidence_score based on actual certainty, not optimism
+15. Mark has_handwritten_text=true if ANY handwriting present
+16. Note text_extraction_method: "text" for digital PDFs, "ocr" for scanned images
+17. Flag low image quality that may affect accuracy
+
+**I-9 SPECIFIC REQUIREMENTS:**
+18. For Section 3 reverification, extract: reverification_document_title, reverification_document_number, 
+    reverification_expiration_date, reverification_employer_name, reverification_date_signed
+19. For Supplement B, use field names: reverification_1_document_title, reverification_1_signature_date, etc.
+20. Distinguish between employer_signature_date (Section 2) and reverification_date_signed (Section 3)
 
 Respond ONLY with the JSON object, no additional text.
 """
@@ -751,6 +789,12 @@ Respond ONLY with the JSON object containing the "pages" array, no additional te
             # Extract structured data
             extracted_values = data.get("extracted_values", {})
             
+            # Validate extracted dates for accuracy
+            extracted_values = self._validate_extracted_dates(extracted_values, page_num)
+            
+            # Validate and correct document titles
+            extracted_values = self._validate_and_correct_document_titles(extracted_values, page_num)
+            
             # Parse text regions
             text_regions = []
             for region_data in data.get("text_regions", []):
@@ -1122,6 +1166,140 @@ Respond ONLY with the JSON object containing the "pages" array, no additional te
             return "employment_record", "other", 0.5
         
         return "other", "other", 0.3
+    
+    def _validate_extracted_dates(self, extracted_values: Dict[str, Any], page_num: int) -> Dict[str, Any]:
+        """
+        Validate extracted date fields for accuracy and flag potential OCR errors.
+        
+        Args:
+            extracted_values (Dict): Extracted field values from the page
+            page_num (int): Page number for logging
+            
+        Returns:
+            Dict: Validated extracted values with warnings logged for suspicious dates
+        """
+        import re
+        from datetime import datetime
+        
+        # Date field patterns to validate
+        date_fields = [
+            'employer_signature_date', 'employee_signature_date', 'date_of_birth',
+            'reverification_date_signed', 'reverification_signature_date',
+            'reverification_1_signature_date', 'reverification_2_signature_date', 'reverification_3_signature_date',
+            'date_of_employer_signature', 'date_of_employee_signature',
+            'work_auth_expiration_date', 'alien_authorized_to_work_until',
+            'reverification_expiration_date', 'reverification_1_expiration_date',
+            'list_a_expiration_date', 'list_b_expiration_date', 'list_c_expiration_date',
+            'rehire_date', 'first_day_of_employment', 'employee_first_day_of_employment'
+        ]
+        
+        for field in date_fields:
+            if field in extracted_values:
+                date_value = extracted_values[field]
+                
+                # Skip null, N/A, or empty values
+                if not date_value or date_value in ['N/A', '', None, 'null']:
+                    continue
+                
+                # Validate date format MM/DD/YYYY
+                date_pattern = r'^(\d{2})/(\d{2})/(\d{4})$'
+                match = re.match(date_pattern, str(date_value))
+                
+                if match:
+                    month, day, year = match.groups()
+                    month_int = int(month)
+                    day_int = int(day)
+                    year_int = int(year)
+                    
+                    # Validate month range
+                    if not (1 <= month_int <= 12):
+                        logger.warning(f"Page {page_num}: Invalid month in {field}: {date_value} (month={month_int})")
+                        logger.warning(f"  → Possible OCR error: Check if '0' was misread as '1' or vice versa")
+                    
+                    # Validate day range
+                    if not (1 <= day_int <= 31):
+                        logger.warning(f"Page {page_num}: Invalid day in {field}: {date_value} (day={day_int})")
+                    
+                    # Validate year range (reasonable for I-9 forms: 1990-2030)
+                    if not (1990 <= year_int <= 2030):
+                        logger.warning(f"Page {page_num}: Suspicious year in {field}: {date_value} (year={year_int})")
+                    
+                    # Try to parse as actual date to catch invalid dates like 02/30/2023
+                    try:
+                        datetime.strptime(date_value, '%m/%d/%Y')
+                    except ValueError as e:
+                        logger.warning(f"Page {page_num}: Invalid date in {field}: {date_value} - {e}")
+                        logger.warning(f"  → Possible OCR error in date extraction")
+                    
+                    # Special check for common OCR errors in handwritten dates
+                    # Check if month looks suspicious (e.g., 12 when it might be 02)
+                    if month == '12' and field in ['reverification_date_signed', 'reverification_signature_date']:
+                        logger.warning(f"Page {page_num}: {field} has month=12 (December)")
+                        logger.warning(f"  → If this is handwritten, verify '12' is not misread '02' (February)")
+                        logger.warning(f"  → Check original document: {date_value}")
+                
+                else:
+                    logger.warning(f"Page {page_num}: Date format error in {field}: {date_value}")
+                    logger.warning(f"  → Expected MM/DD/YYYY format")
+        
+        return extracted_values
+    
+    def _validate_and_correct_document_titles(self, extracted_values: Dict[str, Any], page_num: int) -> Dict[str, Any]:
+        """
+        Validate and apply common OCR corrections to document titles.
+        
+        Args:
+            extracted_values (Dict): Extracted field values from the page
+            page_num (int): Page number for logging
+            
+        Returns:
+            Dict: Corrected extracted values with warnings logged for suspicious titles
+        """
+        # Document title fields to validate
+        title_fields = [
+            'list_a_document_title', 'list_b_document_title', 'list_c_document_title',
+            'section_3_document_title', 'reverification_document_title',
+            'reverification_1_document_title', 'reverification_2_document_title', 'reverification_3_document_title'
+        ]
+        
+        for field in title_fields:
+            if field in extracted_values:
+                title = extracted_values[field]
+                
+                # Skip null, N/A, or empty values
+                if not title or title in ['N/A', '', None, 'null']:
+                    continue
+                
+                original_title = title
+                corrected = False
+                
+                # Common OCR error corrections
+                corrections = [
+                    ("BY ITSELF", "issued by DHS", "Common OCR misread of handwriting"),
+                    ("by itself", "issued by DHS", "Common OCR misread of handwriting"),
+                    ("EAD CARD", "EAD", "Redundant wording"),
+                ]
+                
+                for wrong, correct, reason in corrections:
+                    if wrong in title:
+                        title = title.replace(wrong, correct)
+                        corrected = True
+                        logger.warning(f"Page {page_num}: Corrected {field}")
+                        logger.warning(f"  → Changed '{wrong}' to '{correct}' ({reason})")
+                        logger.warning(f"  → Original: {original_title}")
+                        logger.warning(f"  → Corrected: {title}")
+                
+                # Check for missing I-94
+                if "DS-2019" in title.upper() and "I-94" not in title.upper() and "I94" not in title.upper():
+                    logger.warning(f"Page {page_num}: {field} mentions DS-2019 but missing I-94")
+                    logger.warning(f"  → Title: {title}")
+                    logger.warning(f"  → DS-2019 forms typically come with I-94 - verify if I-94 should be included")
+                
+                # Update the value if corrected
+                if corrected:
+                    extracted_values[field] = title
+        
+        return extracted_values
 
     def clear_cache(self):
         """Clear the analysis cache."""
