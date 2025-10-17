@@ -2,6 +2,28 @@
 
 A comprehensive, modular Python system for processing I-9 Employment Eligibility Verification forms from PDF documents with AI-powered detection, advanced business rules, and comprehensive validation.
 
+## 🔍 How It Works
+
+The system uses a **two-stage processing pipeline**:
+
+### **Stage 1: Catalog Generation (AI Vision + OCR)**
+- **Converts PDF pages to images** (300 DPI by default)
+- **Sends images to Gemini 2.5 Pro Vision AI** for analysis
+- **Gemini performs OCR and data extraction** from the images
+- **Generates catalog.json files** with structured data for each PDF
+- **Enhanced prompts** for accurate handwritten text recognition
+
+### **Stage 2: Rubric Processing (Business Rules)**
+- **Reads catalog.json files** (no AI calls needed)
+- **Applies business rules** for I-9 form validation
+- **Generates CSV reports** with compliance scoring
+- **400x faster** than re-extraction (uses cached catalogs)
+
+This architecture allows you to:
+- ✅ Run extraction once, process multiple times
+- ✅ Tune business rules without re-extracting
+- ✅ Debug extraction vs. business logic separately
+
 ## 🎯 Key Features
 
 ### **Enhanced Processing Pipeline**
@@ -34,19 +56,57 @@ A comprehensive, modular Python system for processing I-9 Employment Eligibility
 
 ## 🚀 Quick Start
 
-### **⚡ Super Quick Start (Recommended)**
+### **⚡ Two-Stage Processing (Recommended)**
+
+The system works in two stages - catalog generation and rubric processing:
+
+#### **Option 1: Run Both Stages Together (Full Pipeline)**
+```bash
+# Generate catalogs AND process with rubric in one command
+python run_processing.py process
+
+# Or manually:
+python regenerate_catalogs.py  # Stage 1: Generate catalogs
+python rubric_processor.py      # Stage 2: Apply business rules
+```
+
+#### **Option 2: Run Catalog Generation Only**
+```bash
+# Generate catalog.json files from PDFs (uses AI Vision + OCR)
+python regenerate_catalogs.py
+
+# Output: workdir/catalogs/*.catalog.json
+# Time: ~1-2 minutes per PDF (depends on page count)
+```
+
+#### **Option 3: Run Rubric Processing Only**
+```bash
+# Process existing catalogs with business rules (no AI calls)
+python rubric_processor.py
+
+# Input: workdir/catalogs/*.catalog.json
+# Output: workdir/rubric_based_results.csv
+# Time: ~1 second per catalog (400x faster!)
+```
+
+#### **Option 4: Reprocess Using Existing Catalogs**
+```bash
+# Skip catalog generation, use existing catalogs
+python run_processing.py reprocess
+
+# Perfect for:
+# - Tuning business rules
+# - Testing different validation thresholds
+# - Quick iterations without AI costs
+```
+
+### **⚡ Legacy Quick Start**
 
 Use the included quick-start script for common tasks:
 
 ```bash
 # Test the system with limited files
 python run_processing.py validate
-
-# Process all files in input directory
-python run_processing.py process
-
-# Reprocess using existing catalogs (400x faster)
-python run_processing.py reprocess
 
 # Clean previous results
 python run_processing.py clean
@@ -73,12 +133,103 @@ cp .env.example .env
 
 4. **Prepare your data**
 ```bash
-# Create directory structure for employee documents
-mkdir -p data/input/[EMPLOYEE_ID]/
-# Place PDF files in employee-specific directories
+# Place PDF files directly in data/input/ folder
+cp your_pdfs/*.pdf data/input/
 
-# Create Excel file with employee IDs
-# File: data/ActiveI9.xlsx with column "Employee ID"
+# The system will process all PDFs in this directory
+```
+
+## 🔧 Technical Details
+
+### **PDF Processing Pipeline**
+
+The system uses a sophisticated image-based processing approach:
+
+1. **PDF to Image Conversion**
+   - Each PDF page is rendered as a high-resolution image (300 DPI)
+   - Uses `pdf2image` library with `poppler` backend
+   - Converts to JPEG format for optimal AI processing
+
+2. **Image Encoding**
+   - Images are base64-encoded for API transmission
+   - Sent to Gemini 2.5 Pro Vision API
+   - Both image and extracted text are provided for best accuracy
+
+3. **AI Vision + OCR**
+   - Gemini performs OCR on the image
+   - Vision model reads handwritten text
+   - Structured data extraction with field validation
+   - Enhanced prompts for date and document title accuracy
+
+4. **Catalog Generation**
+   - Structured JSON output per PDF
+   - Includes extracted values, confidence scores, metadata
+   - Cached for fast reprocessing
+
+### **Why Image-Based Processing?**
+
+✅ **Better OCR Accuracy**: Vision AI handles handwritten text better than traditional OCR  
+✅ **Layout Understanding**: AI understands form structure and context  
+✅ **Signature Detection**: Can identify and validate signatures  
+✅ **Quality Assessment**: Detects image quality issues  
+✅ **Flexible Extraction**: Adapts to different I-9 form versions  
+
+### **Performance Characteristics**
+
+| Stage | Time per PDF | AI Calls | Cost |
+|-------|-------------|----------|------|
+| **Catalog Generation** | 1-2 min | 1 per 3 pages | $$ |
+| **Rubric Processing** | <1 second | 0 | Free |
+| **Reprocessing** | <1 second | 0 | Free |
+
+💡 **Tip**: Generate catalogs once, then iterate on business rules for free!
+
+## 📖 Common Workflows
+
+### **Workflow 1: First-Time Processing**
+```bash
+# Step 1: Place PDFs in input folder
+cp *.pdf data/input/
+
+# Step 2: Generate catalogs (AI Vision + OCR)
+python regenerate_catalogs.py
+
+# Step 3: Process with business rules
+python rubric_processor.py
+
+# Result: workdir/rubric_based_results.csv
+```
+
+### **Workflow 2: Tuning Business Rules**
+```bash
+# Already have catalogs? Just reprocess!
+# Edit rubric_processor.py to adjust rules
+
+python rubric_processor.py  # Instant results!
+
+# No AI calls, no waiting, no cost
+```
+
+### **Workflow 3: Debugging Extraction Issues**
+```bash
+# Check specific page extraction
+python debug_document_title.py
+
+# Regenerate single file
+rm "workdir/catalogs/Employee_Name.catalog.json"
+python regenerate_catalogs.py
+
+# Process again
+python rubric_processor.py
+```
+
+### **Workflow 4: Production Batch Processing**
+```bash
+# Process 100s of files
+python regenerate_catalogs.py  # Takes time, run once
+
+# Generate reports multiple times
+python rubric_processor.py     # Instant, run anytime
 ```
 
 ## Usage Guide

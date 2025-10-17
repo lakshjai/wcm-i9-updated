@@ -11,6 +11,8 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
 import logging
+from fuzzy_field_matcher import FuzzyFieldMatcher
+from rubric_audit_logger import RubricAuditLogger
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -36,6 +38,9 @@ class I9RubricProcessor:
             
             filename = Path(catalog_path).stem.replace('.catalog', '')
             
+            # Initialize audit logger
+            audit_logger = RubricAuditLogger(filename)
+            
             # Apply rubric buckets
             bucket_1_score, bucket_1_data = self._bucket_1_personal_data(catalog_data)
             bucket_2_score, bucket_2_data = self._bucket_2_i9_detection(catalog_data)
@@ -55,9 +60,36 @@ class I9RubricProcessor:
                 bucket_5_score, bucket_5_data
             )
             
+            # Log bucket results to audit
+            audit_logger.log_bucket_1_personal_data(bucket_1_score, bucket_1_data, 
+                                                     scoring_reasons.get('bucket_1_reasons', '').split(' | '))
+            audit_logger.log_bucket_2_i9_detection(bucket_2_score, bucket_2_data,
+                                                   scoring_reasons.get('bucket_2_reasons', '').split(' | '))
+            audit_logger.log_bucket_3_business_rules(bucket_3_score, bucket_3_data,
+                                                     scoring_reasons.get('bucket_3_reasons', '').split(' | '))
+            audit_logger.log_bucket_4_work_authorization(bucket_4_score, bucket_4_data,
+                                                         scoring_reasons.get('bucket_4_reasons', '').split(' | '))
+            audit_logger.log_bucket_5_document_tracking(bucket_5_score, bucket_5_data,
+                                                        scoring_reasons.get('bucket_5_reasons', '').split(' | '))
+            
+            # Log business fields
+            audit_logger.log_business_fields(business_fields)
+            
             # Calculate total score and status
             total_score = bucket_1_score + bucket_2_score + bucket_3_score + bucket_4_score + bucket_5_score
-            status = self._determine_status(total_score, bucket_1_score, bucket_2_score, bucket_3_score)
+            status, criteria_met, reasoning = self._determine_status_with_audit(total_score, bucket_1_score, bucket_2_score, bucket_3_score, business_fields)
+            
+            # Log status determination
+            citizenship = business_fields.get('citizenship_status', 'UNKNOWN')
+            audit_logger.log_status_determination(status, citizenship, criteria_met, reasoning)
+            
+            # Add summary
+            audit_logger.add_summary(total_score)
+            
+            # Save audit log
+            audit_output_path = f"workdir/audit_logs/{filename}_audit.json"
+            Path("workdir/audit_logs").mkdir(parents=True, exist_ok=True)
+            audit_logger.save(audit_output_path)
             
             result = {
                 'filename': filename,
@@ -306,6 +338,7 @@ class I9RubricProcessor:
                 extracted.get('reverification_signature_date'),
                 extracted.get('reverification_date_signed'),
                 extracted.get('employer_signature_date_reverification'),
+                extracted.get('signature_date'),  # ADDED: Common signature field (Balder Supplement B has this)
                 # Additional variations found in catalogs
                 extracted.get('date_of_employer_signature'),  # ← Debek has this
                 extracted.get('date_of_employee_signature'),  # ← Additional coverage
@@ -462,118 +495,111 @@ class I9RubricProcessor:
             score += 3  # Proper Document Section Selection
             data['business_rules_applied'] = True
         
+        # Store page counts for reporting
+        data['supplement_b_pages_count'] = len(supplement_b_pages)
+        data['section_3_pages_count'] = len(section_3_pages)
+        data['standard_i9_pages_count'] = len(standard_i9_pages)
+        
         logger.info(f"Bucket 3 (Business Rules): {score}/25 points - Selected: {selected_type} ({data['selected_form_validity']})")
         return score, data
     
     def _validate_supplement_b_pages(self, supplement_b_pages: List[Dict]) -> bool:
         """
-        Validate if Supplement B pages contain meaningful data
+        Validate if Supplement B pages contain meaningful data using fuzzy matching
         """
         if not supplement_b_pages:
             return False
+        
+        matcher = FuzzyFieldMatcher(similarity_threshold=0.6)
         
         for page_info in supplement_b_pages:
             page = page_info['page']
             extracted = page.get('extracted_values', {})
             
-            # Check for signature dates
-            has_signature = any([
-                extracted.get('employer_signature_date'),
-                extracted.get('reverification_signature_date'),
-                extracted.get('date_of_employer_signature'),
-                # Supplement B specific signature fields
-                extracted.get('reverification_1_signature_date'),
-                extracted.get('reverification_2_signature_date'),
-                extracted.get('reverification_3_signature_date')
-            ])
+            # Use fuzzy matching to find signature fields
+            signature_matches = matcher.find_signature_fields(extracted)
+            has_signature = len(signature_matches) > 0
             
-            # Check for meaningful content
-            has_content = any([
-                extracted.get('reverification_document_title'),
-                extracted.get('reverification_1_document_title'),
-                extracted.get('employee_first_name'),
-                extracted.get('employee_last_name'),
-                extracted.get('work_authorization_expiry_date')
-            ])
+            # Use fuzzy matching to find content fields
+            document_matches = matcher.find_document_title_fields(extracted)
+            name_matches = [
+                matcher.find_name_field(extracted, 'first_name'),
+                matcher.find_name_field(extracted, 'last_name')
+            ]
+            expiry_matches = matcher.find_expiry_date_fields(extracted)
+            
+            has_content = (len(document_matches) > 0 or 
+                          any(name_matches) or 
+                          len(expiry_matches) > 0)
             
             if has_signature and has_content:
+                logger.info(f"Supplement B validation: VALID - Found {len(signature_matches)} signature(s), content fields present")
                 return True
         
+        logger.info(f"Supplement B validation: INVALID - Missing required fields")
         return False
     
     def _validate_section_3_pages(self, section_3_pages: List[Dict]) -> bool:
         """
-        Validate if Section 3 pages contain meaningful data
+        Validate if Section 3 pages contain meaningful data using fuzzy matching
         """
         if not section_3_pages:
             return False
+        
+        matcher = FuzzyFieldMatcher(similarity_threshold=0.6)
         
         for page_info in section_3_pages:
             page = page_info['page']
             extracted = page.get('extracted_values', {})
             
-            # Check for signature dates
-            has_signature = any([
-                extracted.get('reverification_date_signed'),
-                extracted.get('reverification_signature_date'),
-                extracted.get('employer_signature_date'),
-                extracted.get('date_of_employer_signature')
-            ])
+            # Use fuzzy matching to find signature fields
+            signature_matches = matcher.find_signature_fields(extracted)
+            has_signature = len(signature_matches) > 0
             
-            # Check for meaningful content
-            has_content = any([
-                extracted.get('reverification_document_title'),
-                extracted.get('section_3_document_title'),
-                extracted.get('work_authorization_expiry_date'),
-                extracted.get('work_auth_expiration_date'),
-                extracted.get('alien_authorized_to_work_until')
-            ])
+            # Use fuzzy matching to find content fields
+            document_matches = matcher.find_document_title_fields(extracted)
+            expiry_matches = matcher.find_expiry_date_fields(extracted)
+            
+            has_content = len(document_matches) > 0 or len(expiry_matches) > 0
             
             if has_signature and has_content:
+                logger.info(f"Section 3 validation: VALID - Found {len(signature_matches)} signature(s), content fields present")
                 return True
         
+        logger.info(f"Section 3 validation: INVALID - Missing required fields")
         return False
     
     def _validate_standard_i9_pages(self, standard_i9_pages: List[Dict]) -> bool:
         """
-        Validate if Standard I-9 pages contain meaningful data
+        Validate if Standard I-9 pages contain meaningful data using fuzzy matching
         """
         if not standard_i9_pages:
             return False
+        
+        matcher = FuzzyFieldMatcher(similarity_threshold=0.6)
         
         for page_info in standard_i9_pages:
             page = page_info['page']
             extracted = page.get('extracted_values', {})
             
-            # Check for signature dates
-            has_signature = any([
-                extracted.get('employer_signature_date'),
-                extracted.get('date_of_employer_signature'),
-                extracted.get('employee_signature_date'),
-                extracted.get('date_of_employee_signature')
-            ])
+            # Use fuzzy matching to find signature fields
+            signature_matches = matcher.find_signature_fields(extracted)
+            has_signature = len(signature_matches) > 0
             
-            # Check for meaningful content
-            has_content = any([
-                # Document fields
-                extracted.get('list_a_document_title'),
-                extracted.get('list_b_document_title'),
-                extracted.get('list_c_document_title'),
-                extracted.get('list_a_document_1_title'),
-                extracted.get('list_a_document_2_title'),
-                extracted.get('list_a_document_3_title'),
-                # Personal information
-                extracted.get('employee_first_name'),
-                extracted.get('employee_last_name'),
-                extracted.get('employee_date_of_birth'),
-                extracted.get('first_name'),
-                extracted.get('last_name'),
-                extracted.get('date_of_birth')
-            ])
+            # Use fuzzy matching to find content fields
+            document_matches = matcher.find_document_title_fields(extracted)
+            name_matches = [
+                matcher.find_name_field(extracted, 'first_name'),
+                matcher.find_name_field(extracted, 'last_name')
+            ]
+            
+            has_content = len(document_matches) > 0 or any(name_matches)
             
             if has_signature and has_content:
+                logger.info(f"Standard I-9 validation: VALID - Found {len(signature_matches)} signature(s), content fields present")
                 return True
         
+        logger.info(f"Standard I-9 validation: INVALID - Missing required fields")
         return False
     
     def _bucket_4_work_authorization(self, catalog_data: Dict, bucket_3_data: Dict) -> Tuple[int, Dict]:
@@ -793,8 +819,8 @@ class I9RubricProcessor:
             'total_i9_sets_found': 0,
             'section_1_pages_count': bucket_2_data.get('section_1_pages_found', 0),
             'section_2_pages_count': bucket_2_data.get('section_2_pages_found', 0),
-            'section_3_pages_count': bucket_2_data.get('section_3_supplement_pages_found', 0),
-            'supplement_b_pages_count': 0,
+            'section_3_pages_count': bucket_3_data.get('section_3_pages_count', 0),
+            'supplement_b_pages_count': bucket_3_data.get('supplement_b_pages_count', 0),
             
             # Primary I-9 Set Information
             'primary_i9_set_signature_date': bucket_3_data.get('selected_form_signature_date', ''),
@@ -973,22 +999,98 @@ class I9RubricProcessor:
         form_type = business_fields['form_type_detected']
         documents = []
         
-        for page in pages:
+        # For Section 3 and Supplement B, we need to extract ONLY from the LATEST page
+        # Build a list of pages to extract from based on form type
+        pages_to_extract = []
+        
+        if form_type == 'reverification_section_3' or form_type == 're-verification':
+            # Find all Section 3 pages with signature dates
+            section3_pages = []
+            for page in pages:
+                page_title = page.get('page_title', '').lower()
+                extracted = page.get('extracted_values', {})
+                if 'section 3' in page_title or 'reverification' in page_title:
+                    # Get signature date from this page
+                    sig_dates = [
+                        extracted.get('employer_signature_date'),
+                        extracted.get('reverification_signature_date'),
+                        extracted.get('reverification_date_signed')
+                    ]
+                    latest_sig = None
+                    for sig_date in sig_dates:
+                        if sig_date and sig_date not in ['N/A', '', None]:
+                            if not latest_sig or self._parse_date_for_comparison(sig_date) > self._parse_date_for_comparison(latest_sig):
+                                latest_sig = sig_date
+                    
+                    if latest_sig:
+                        section3_pages.append({'page': page, 'signature_date': latest_sig})
+            
+            # Select ONLY the page with the latest signature date
+            if section3_pages:
+                latest_section3 = max(section3_pages, key=lambda x: self._parse_date_for_comparison(x['signature_date']))
+                pages_to_extract = [latest_section3['page']]
+        
+        elif form_type == 'rehire_supplement_b' or form_type == 're-hire':
+            # Find all Supplement B pages with signature dates
+            supplement_b_pages = []
+            for page in pages:
+                page_title = page.get('page_title', '').lower()
+                extracted = page.get('extracted_values', {})
+                if 'supplement b' in page_title:
+                    # Get signature date from this page
+                    sig_dates = [
+                        extracted.get('employer_signature_date'),
+                        extracted.get('reverification_signature_date'),
+                        extracted.get('reverification_1_signature_date')
+                    ]
+                    latest_sig = None
+                    for sig_date in sig_dates:
+                        if sig_date and sig_date not in ['N/A', '', None]:
+                            if not latest_sig or self._parse_date_for_comparison(sig_date) > self._parse_date_for_comparison(latest_sig):
+                                latest_sig = sig_date
+                    
+                    if latest_sig:
+                        supplement_b_pages.append({'page': page, 'signature_date': latest_sig})
+            
+            # Select ONLY the page with the latest signature date
+            if supplement_b_pages:
+                latest_supplement_b = max(supplement_b_pages, key=lambda x: self._parse_date_for_comparison(x['signature_date']))
+                pages_to_extract = [latest_supplement_b['page']]
+        
+        else:
+            # For Standard I-9, extract from all Section 2 pages
+            for page in pages:
+                page_title = page.get('page_title', '').lower()
+                if 'section 2' in page_title or 'employment eligibility' in page_title:
+                    pages_to_extract.append(page)
+        
+        # Now extract documents from the selected pages
+        for page in pages_to_extract:
             page_title = page.get('page_title', '').lower()
             extracted = page.get('extracted_values', {})
             
-            should_extract = False
-            if form_type == 'rehire_supplement_b' and 'supplement b' in page_title:
-                should_extract = True
-            elif form_type == 'reverification_section_3' and ('section 3' in page_title or 'reverification' in page_title):
-                should_extract = True
-            elif 'section 2' in page_title or 'employment eligibility' in page_title:
-                should_extract = True
-            
-            if should_extract:
-                # Comprehensive document field variations found in analysis
+            # Comprehensive document field variations found in analysis
+            # Determine which document fields to extract based on form type
+            if form_type == 'reverification_section_3' or form_type == 're-verification':
+                # For Section 3/Reverification: ONLY extract Section 3 documents
                 doc_fields = [
-                    'reverification_document_title', 'section_3_document_title',
+                    'section_3_document_title',
+                    'reverification_document_title',
+                    'reverification_1_document_title', 'reverification_2_document_title', 'reverification_3_document_title',
+                    # Additional variations found in catalogs (e.g., Page 12 of Wu, Qianyi)
+                    'document_title_list_a_1', 'document_title_list_a_2', 'document_title_list_a_3',
+                    'document_title_list_b_1', 'document_title_list_b_2',
+                    'document_title_list_c_1', 'document_title_list_c_2'
+                ]
+            elif form_type == 'rehire_supplement_b' or form_type == 're-hire':
+                # For Supplement B: Extract reverification documents
+                doc_fields = [
+                    'reverification_document_title',
+                    'reverification_1_document_title', 'reverification_2_document_title', 'reverification_3_document_title'
+                ]
+            else:
+                # For Standard I-9: Extract Section 2 documents (List A/B/C)
+                doc_fields = [
                     'list_a_document_title', 'list_b_document_title', 'list_c_document_title',
                     # Numbered variations
                     'list_a_document_1_title', 'list_a_document_2_title', 'list_a_document_3_title',
@@ -999,32 +1101,30 @@ class I9RubricProcessor:
                     'list_b_document_title_1', 'list_b_document_title_2', 'list_b_document_title_3',
                     'list_c_document_title_1', 'list_c_document_title_2', 'list_c_document_title_3',
                     # Section 2 specific
-                    'section_2_list_a_document_title', 'section_2_list_b_document_title', 'section_2_list_c_document_title',
-                    # Reverification specific
-                    'reverification_1_document_title', 'reverification_2_document_title', 'reverification_3_document_title'
+                    'section_2_list_a_document_title', 'section_2_list_b_document_title', 'section_2_list_c_document_title'
                 ]
-                
-                for field in doc_fields:
-                    doc_title = extracted.get(field)
-                    if doc_title and doc_title not in ['N/A', '', None]:
-                        # Try multiple number field variations
-                        number_variations = [
-                            field.replace('title', 'number'),
-                            field.replace('_title', '_number'),
-                            field.replace('document_title', 'document_number')
-                        ]
-                        
-                        doc_number = ''
-                        for num_field in number_variations:
-                            num_val = extracted.get(num_field)
-                            if num_val and num_val not in ['N/A', '', None]:
-                                doc_number = num_val
-                                break
-                        
-                        if doc_number:
-                            documents.append(f"{doc_title} (#{doc_number})")
-                        else:
-                            documents.append(doc_title)
+            
+            for field in doc_fields:
+                doc_title = extracted.get(field)
+                if doc_title and doc_title not in ['N/A', '', None]:
+                    # Try multiple number field variations
+                    number_variations = [
+                        field.replace('title', 'number'),
+                        field.replace('_title', '_number'),
+                        field.replace('document_title', 'document_number')
+                    ]
+                    
+                    doc_number = ''
+                    for num_field in number_variations:
+                        num_val = extracted.get(num_field)
+                        if num_val and num_val not in ['N/A', '', None]:
+                            doc_number = num_val
+                            break
+                    
+                    if doc_number:
+                        documents.append(f"{doc_title} (#{doc_number})")
+                    else:
+                        documents.append(doc_title)
         
         business_fields['documents_in_primary_set'] = ' | '.join(documents)
         business_fields['document_count_in_primary_set'] = len(documents)
@@ -1387,26 +1487,183 @@ class I9RubricProcessor:
         
         return reasons
     
-    def _determine_status(self, total_score: int, bucket_1_score: int, bucket_2_score: int, bucket_3_score: int) -> str:
+    def _all_documents_attached(self, business_fields: Dict) -> bool:
         """
-        Determine overall status based on total score and critical requirements
+        Check if all listed documents are attached to PDF
+        Returns True if matching_support_documents_not_attached is empty
         """
-        # Critical requirements
-        has_i9_forms = bucket_2_score >= 10
-        has_personal_data = bucket_1_score >= 12
-        follows_business_rules = bucket_3_score >= 15
+        not_attached = str(business_fields.get('matching_support_documents_not_attached', ''))
+        return not_attached in ['', 'nan', 'N/A', 'None'] or not not_attached
+    
+    def _has_expiry_match(self, business_fields: Dict) -> bool:
+        """
+        Check if work authorization expiry matches document expiry
+        Returns True if expiry_date_matches contains "MATCH:"
+        """
+        expiry_matches = str(business_fields.get('expiry_date_matches', ''))
+        return 'MATCH:' in expiry_matches
+    
+    def _determine_status(self, total_score: int, bucket_1_score: int, bucket_2_score: int, bucket_3_score: int, business_fields: Dict = None) -> str:
+        """
+        Determine overall status based on citizenship-specific criteria
         
+        US Citizen Requirements:
+        1. First name
+        2. Last name
+        3. Date of birth
+        4. All listed documents attached
+        
+        Non-Citizen Requirements:
+        1. First name
+        2. Last name
+        3. Date of birth
+        4. Expiry date matches
+        5. All listed documents attached
+        """
+        # Critical requirement: Must have I-9 forms
+        has_i9_forms = bucket_2_score >= 10
         if not has_i9_forms:
             return "NO_I9_FOUND"
         
-        if total_score >= 85 and has_personal_data and follows_business_rules:
-            return "COMPLETE_SUCCESS"
-        elif total_score >= 60:
-            return "PARTIAL_SUCCESS"
-        elif total_score >= 40:
-            return "ERROR"
+        # If business_fields not provided, fall back to old logic
+        if business_fields is None:
+            has_personal_data = bucket_1_score >= 12
+            follows_business_rules = bucket_3_score >= 15
+            
+            if total_score >= 85 and has_personal_data and follows_business_rules:
+                return "COMPLETE_SUCCESS"
+            elif total_score >= 60:
+                return "PARTIAL_SUCCESS"
+            elif total_score >= 40:
+                return "ERROR"
+            else:
+                return "NO_I9_FOUND"
+        
+        # New citizenship-based logic
+        # Check basic required fields
+        first_name = business_fields.get('employee_first_name', '')
+        last_name = business_fields.get('employee_last_name', '')
+        dob = business_fields.get('employee_date_of_birth', '')
+        
+        has_first_name = first_name and str(first_name) not in ['', 'N/A', 'nan', 'None']
+        has_last_name = last_name and str(last_name) not in ['', 'N/A', 'nan', 'None']
+        has_dob = dob and str(dob) not in ['', 'N/A', 'nan', 'None']
+        
+        # Check if all documents are attached
+        all_docs_attached = self._all_documents_attached(business_fields)
+        
+        # Determine citizenship
+        citizenship = str(business_fields.get('citizenship_status', '')).lower()
+        is_us_citizen = 'us citizen' in citizenship or 'citizen of the united states' in citizenship
+        
+        if is_us_citizen:
+            # US Citizen: 4 criteria
+            if has_first_name and has_last_name and has_dob and all_docs_attached:
+                return 'COMPLETE_SUCCESS'
+            else:
+                return 'PARTIAL_SUCCESS'
         else:
-            return "NO_I9_FOUND"
+            # Non-Citizen: 5 criteria
+            has_expiry_match = self._has_expiry_match(business_fields)
+            
+            if has_first_name and has_last_name and has_dob and has_expiry_match and all_docs_attached:
+                return 'COMPLETE_SUCCESS'
+            else:
+                return 'PARTIAL_SUCCESS'
+    
+    def _determine_status_with_audit(self, total_score: int, bucket_1_score: int, bucket_2_score: int, bucket_3_score: int, business_fields: Dict = None) -> Tuple[str, Dict, str]:
+        """
+        Determine status and return detailed audit information
+        Returns: (status, criteria_met, reasoning)
+        """
+        # Critical requirement: Must have I-9 forms
+        has_i9_forms = bucket_2_score >= 10
+        if not has_i9_forms:
+            return "NO_I9_FOUND", {}, "No I-9 forms detected in the document"
+        
+        if business_fields is None:
+            status = self._determine_status(total_score, bucket_1_score, bucket_2_score, bucket_3_score, None)
+            return status, {}, "Legacy status determination (no business fields)"
+        
+        # Check basic required fields
+        first_name = business_fields.get('employee_first_name', '')
+        last_name = business_fields.get('employee_last_name', '')
+        dob = business_fields.get('employee_date_of_birth', '')
+        
+        has_first_name = first_name and str(first_name) not in ['', 'N/A', 'nan', 'None']
+        has_last_name = last_name and str(last_name) not in ['', 'N/A', 'nan', 'None']
+        has_dob = dob and str(dob) not in ['', 'N/A', 'nan', 'None']
+        
+        # Check if all documents are attached
+        all_docs_attached = self._all_documents_attached(business_fields)
+        not_attached = business_fields.get('matching_support_documents_not_attached', '')
+        
+        # Determine citizenship
+        citizenship = str(business_fields.get('citizenship_status', '')).lower()
+        is_us_citizen = 'us citizen' in citizenship or 'citizen of the united states' in citizenship
+        
+        criteria_met = {
+            'has_first_name': has_first_name,
+            'has_last_name': has_last_name,
+            'has_dob': has_dob,
+            'all_docs_attached': all_docs_attached,
+            'first_name_value': first_name,
+            'last_name_value': last_name,
+            'dob_value': dob,
+            'docs_not_attached': not_attached
+        }
+        
+        if is_us_citizen:
+            # US Citizen: 4 criteria
+            criteria_met['citizenship_type'] = 'US Citizen'
+            criteria_met['required_criteria_count'] = 4
+            
+            reasons = []
+            reasons.append(f"Citizenship: US Citizen")
+            reasons.append(f"1. First Name: {'✅ ' + str(first_name) if has_first_name else '❌ NOT FOUND'}")
+            reasons.append(f"2. Last Name: {'✅ ' + str(last_name) if has_last_name else '❌ NOT FOUND'}")
+            reasons.append(f"3. Date of Birth: {'✅ ' + str(dob) if has_dob else '❌ NOT FOUND'}")
+            reasons.append(f"4. All Docs Attached: {'✅ YES' if all_docs_attached else '❌ NO - Missing: ' + str(not_attached)}")
+            
+            if has_first_name and has_last_name and has_dob and all_docs_attached:
+                status = 'COMPLETE_SUCCESS'
+                reasons.append("Result: ALL 4 CRITERIA MET → COMPLETE_SUCCESS")
+            else:
+                status = 'PARTIAL_SUCCESS'
+                failed_count = sum([not has_first_name, not has_last_name, not has_dob, not all_docs_attached])
+                reasons.append(f"Result: {failed_count} CRITERIA FAILED → PARTIAL_SUCCESS")
+            
+            reasoning = ' | '.join(reasons)
+            
+        else:
+            # Non-Citizen: 5 criteria
+            has_expiry_match = self._has_expiry_match(business_fields)
+            expiry_match_detail = business_fields.get('expiry_date_matches', '')
+            
+            criteria_met['citizenship_type'] = 'Non-Citizen'
+            criteria_met['required_criteria_count'] = 5
+            criteria_met['has_expiry_match'] = has_expiry_match
+            criteria_met['expiry_match_detail'] = expiry_match_detail
+            
+            reasons = []
+            reasons.append(f"Citizenship: Non-Citizen")
+            reasons.append(f"1. First Name: {'✅ ' + str(first_name) if has_first_name else '❌ NOT FOUND'}")
+            reasons.append(f"2. Last Name: {'✅ ' + str(last_name) if has_last_name else '❌ NOT FOUND'}")
+            reasons.append(f"3. Date of Birth: {'✅ ' + str(dob) if has_dob else '❌ NOT FOUND'}")
+            reasons.append(f"4. Expiry Match: {'✅ YES - ' + str(expiry_match_detail) if has_expiry_match else '❌ NO - ' + str(expiry_match_detail)}")
+            reasons.append(f"5. All Docs Attached: {'✅ YES' if all_docs_attached else '❌ NO - Missing: ' + str(not_attached)}")
+            
+            if has_first_name and has_last_name and has_dob and has_expiry_match and all_docs_attached:
+                status = 'COMPLETE_SUCCESS'
+                reasons.append("Result: ALL 5 CRITERIA MET → COMPLETE_SUCCESS")
+            else:
+                status = 'PARTIAL_SUCCESS'
+                failed_count = sum([not has_first_name, not has_last_name, not has_dob, not has_expiry_match, not all_docs_attached])
+                reasons.append(f"Result: {failed_count} CRITERIA FAILED → PARTIAL_SUCCESS")
+            
+            reasoning = ' | '.join(reasons)
+        
+        return status, criteria_met, reasoning
     
     def _create_error_result(self, filename: str, error_msg: str) -> Dict:
         """Create error result for failed processing"""
