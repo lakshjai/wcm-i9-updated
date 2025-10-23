@@ -130,14 +130,14 @@ class PDFProcessor:
             return []
     
     @staticmethod
-    def render_page_to_image(pdf_path, page_num, dpi=300, max_retries=None, retry_delay=None):
+    def render_page_to_image(pdf_path, page_num, dpi=None, max_retries=None, retry_delay=None):
         """
         Render a PDF page to an image using PyMuPDF with retry logic.
         
         Args:
             pdf_path (str): Path to the PDF file.
             page_num (int): Page number to render (0-indexed).
-            dpi (int): DPI for rendering.
+            dpi (int, optional): DPI for rendering. Defaults to settings.PDF_DPI.
             max_retries (int, optional): Maximum number of retry attempts for network issues.
                                        Defaults to settings.FILE_ACCESS_MAX_RETRIES.
             retry_delay (float, optional): Delay between retries in seconds.
@@ -150,6 +150,7 @@ class PDFProcessor:
         from ..config import settings
         
         # Use settings defaults if not provided
+        dpi = dpi if dpi is not None else settings.PDF_DPI
         max_retries = max_retries if max_retries is not None else settings.FILE_ACCESS_MAX_RETRIES
         retry_delay = retry_delay if retry_delay is not None else settings.FILE_ACCESS_RETRY_DELAY
         
@@ -165,14 +166,49 @@ class PDFProcessor:
                     page = doc[page_num]
                     
                     # Calculate zoom factor based on DPI (default is 72 dpi)
-                    zoom = dpi / 72
+                    # Apply additional scale factor for improved small text extraction
+                    base_zoom = dpi / 72
+                    scale_factor = settings.PDF_IMAGE_SCALE_FACTOR
+                    zoom = base_zoom * scale_factor
+                    
+                    # Smart image size limiting to avoid API errors
+                    # Gemini has ~20MB limit, aim for max 10MB to be safe
+                    MAX_IMAGE_SIZE_MB = 10
+                    MAX_PIXELS = 16_000_000  # ~4000x4000 pixels
+                    
+                    # Get page dimensions
+                    page_rect = page.rect
+                    page_width = page_rect.width
+                    page_height = page_rect.height
+                    
+                    # Calculate resulting image dimensions
+                    img_width = int(page_width * zoom)
+                    img_height = int(page_height * zoom)
+                    total_pixels = img_width * img_height
+                    
+                    # If image would be too large, reduce zoom
+                    if total_pixels > MAX_PIXELS:
+                        reduction_factor = (MAX_PIXELS / total_pixels) ** 0.5
+                        zoom = zoom * reduction_factor
+                        img_width = int(page_width * zoom)
+                        img_height = int(page_height * zoom)
+                        logger.warning(f"Reduced zoom from {base_zoom * scale_factor:.2f} to {zoom:.2f} to avoid oversized image ({img_width}x{img_height})")
+                    
                     matrix = fitz.Matrix(zoom, zoom)
                     
-                    # Render page to pixmap
-                    pixmap = page.get_pixmap(matrix=matrix)
+                    # Render page to pixmap with high quality settings
+                    pixmap = page.get_pixmap(matrix=matrix, alpha=False)
                     
-                    # Convert pixmap to PNG bytes
+                    # Convert pixmap to image bytes (PNG format for lossless quality)
                     img_bytes = pixmap.tobytes("png")
+                    img_size_mb = len(img_bytes) / (1024 * 1024)
+                    
+                    logger.debug(f"Rendered page {page_num} at {dpi} DPI with {scale_factor}x scale (effective: {zoom*72:.0f} DPI, size: {img_size_mb:.2f}MB, {img_width}x{img_height}px)")
+                    
+                    # If still too large, warn but proceed
+                    if img_size_mb > MAX_IMAGE_SIZE_MB:
+                        logger.warning(f"Image size {img_size_mb:.2f}MB exceeds {MAX_IMAGE_SIZE_MB}MB - may cause API errors")
+                    
                     PDFProcessor._image_cache[cache_key] = img_bytes
                     doc.close()
                     return img_bytes
@@ -200,19 +236,23 @@ class PDFProcessor:
         return None
     
     @staticmethod
-    def render_page_to_base64(pdf_path, page_num, dpi=300):
+    def render_page_to_base64(pdf_path, page_num, dpi=None):
         """
         Render a PDF page to a base64-encoded image.
         
         Args:
             pdf_path (str): Path to the PDF file.
             page_num (int): Page number to render (0-indexed).
-            dpi (int): DPI for rendering.
+            dpi (int, optional): DPI for rendering. Defaults to settings.PDF_DPI.
             
         Returns:
             str: Base64-encoded image string.
         """
         import base64
+        from ..config import settings
+        
+        # Use settings default if not provided
+        dpi = dpi if dpi is not None else settings.PDF_DPI
         
         img_bytes = PDFProcessor.render_page_to_image(pdf_path, page_num, dpi)
         if img_bytes:

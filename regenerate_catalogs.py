@@ -7,6 +7,7 @@ import os
 import sys
 from pathlib import Path
 from glob import glob
+from dotenv import load_dotenv
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -19,6 +20,9 @@ from hri9.utils.logging_config import logger
 def main():
     """Regenerate all catalog files from PDF inputs."""
     
+    # Load environment variables from .env file
+    load_dotenv()
+    
     # Setup
     input_dir = "data/input"
     catalog_output_dir = "workdir/catalogs"
@@ -26,9 +30,20 @@ def main():
     # Create output directory if it doesn't exist
     Path(catalog_output_dir).mkdir(parents=True, exist_ok=True)
     
-    # Initialize Gemini client
-    logger.info("Initializing Gemini AI client...")
-    gemini_client = GeminiClient()
+    # Read configuration from environment variables
+    api_key = os.getenv("OPENAI_API_KEY")
+    base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    model_name = os.getenv("I9_MODEL_NAME") or os.getenv("GEMINI_MODEL", "google.gemini-2.5-pro")
+    
+    # Initialize AI client with configuration from .env
+    logger.info(f"Initializing AI client...")
+    logger.info(f"  Model: {model_name}")
+    logger.info(f"  Base URL: {base_url}")
+    gemini_client = GeminiClient(
+        api_key=api_key,
+        base_url=base_url,
+        model=model_name
+    )
     
     # Initialize catalog system
     logger.info("Initializing document catalog system...")

@@ -13,6 +13,7 @@ from typing import Dict, List, Tuple, Optional
 import logging
 from fuzzy_field_matcher import FuzzyFieldMatcher
 from rubric_audit_logger import RubricAuditLogger
+from json_flattener import flatten_extracted_values
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -25,6 +26,7 @@ class I9RubricProcessor:
     
     def __init__(self):
         self.results = []
+        self.fuzzy_matcher = FuzzyFieldMatcher(similarity_threshold=0.6)
         
     def process_catalog_file(self, catalog_path: str) -> Dict:
         """
@@ -237,8 +239,8 @@ class I9RubricProcessor:
             if is_i9:
                 i9_pages.append(page)
                 
-                # Classify sections
-                if 'section 1' in page_title or any(k in extracted for k in ['employee_first_name', 'employee_last_name']):
+                # Classify sections - Only count actual Section 1 pages
+                if 'section 1' in page_title:
                     section_1_count += 1
                 
                 if 'section 2' in page_title or any(k in extracted for k in ['employer_signature_date', 'list_a_document']):
@@ -328,47 +330,64 @@ class I9RubricProcessor:
         section_3_pages = []
         standard_i9_pages = []
         
+        # Use fuzzy matcher for robust signature detection
+        matcher = FuzzyFieldMatcher(similarity_threshold=0.6)
+        
         for page in pages:
             page_title = page.get('page_title', '').lower()
             extracted = page.get('extracted_values', {})
             
-            # Get signature dates (including fresh catalog variations)
-            sig_dates = [
-                extracted.get('employer_signature_date'),
-                extracted.get('reverification_signature_date'),
-                extracted.get('reverification_date_signed'),
-                extracted.get('employer_signature_date_reverification'),
-                extracted.get('signature_date'),  # ADDED: Common signature field (Balder Supplement B has this)
-                # Additional variations found in catalogs
-                extracted.get('date_of_employer_signature'),  # ← Debek has this
-                extracted.get('date_of_employee_signature'),  # ← Additional coverage
-                extracted.get('section_3_signature_date'),
-                extracted.get('section_3_employer_signature_date'),
-                # Supplement B specific signature fields
-                extracted.get('reverification_1_signature_date'),  # ← Balder has this
-                extracted.get('reverification_2_signature_date'),
-                extracted.get('reverification_3_signature_date'),
-                extracted.get('reverification_1_employer_signature_date'),
-                extracted.get('reverification_2_employer_signature_date'),
-                extracted.get('reverification_3_employer_signature_date')
-            ]
+            # UNIVERSAL SOLUTION: Flatten any nested JSON structure
+            # This handles reverification_blocks, section_3_blocks, or ANY future nested structure
+            # No need to check for specific structure names - just flatten everything!
+            flattened = flatten_extracted_values(extracted)
             
+            # Use fuzzy matching on the flattened structure
+            # Now ALL fields are accessible at top level, regardless of original nesting
+            signature_matches = matcher.find_signature_fields(flattened)
+            
+            # Find the latest signature date from all matches
             latest_sig = None
-            for sig_date in sig_dates:
-                if sig_date and sig_date not in ['N/A', '', None]:
-                    if not latest_sig or sig_date > latest_sig:
-                        latest_sig = sig_date
+            if signature_matches:
+                for field_name, date_value, confidence in signature_matches:
+                    if date_value and date_value not in ['N/A', '', None]:
+                        # CRITICAL: Validate it's actually a date format (MM/DD/YYYY)
+                        # This prevents names like "Fatima Yamin" from being treated as dates
+                        if not self._is_valid_date_format(str(date_value)):
+                            continue
+                        
+                        # Also exclude non-signature date fields
+                        if any(term in field_name.lower() for term in ['birth', 'dob', 'expir', 'valid', '_name']):
+                            continue
+                        
+                        # Parse date for comparison
+                        try:
+                            if not latest_sig or date_value > latest_sig:
+                                latest_sig = date_value
+                        except:
+                            # If comparison fails, just use the first valid date
+                            if not latest_sig:
+                                latest_sig = date_value
             
             # Only consider pages with valid signatures as valid documents
             if latest_sig:
                 if 'supplement b' in page_title:
                     supplement_b_pages.append({'page': page, 'signature_date': latest_sig})
-                elif ('section 3' in page_title or 'reverification' in page_title or 
-                      # Check if page has reverification data even if title mentions both sections
-                      any(field in extracted for field in ['reverification_document_title', 'reverification_date_signed', 'reverification_signature_date'])):
+                elif 'section 3' in page_title or 'reverification' in page_title:
+                    # Section 3 or Reverification page
                     section_3_pages.append({'page': page, 'signature_date': latest_sig})
                 elif 'i-9' in page_title or 'employment eligibility' in page_title:
-                    standard_i9_pages.append({'page': page, 'signature_date': latest_sig})
+                    # Check if this is actually a Section 3 page with reverification data
+                    # Use fuzzy matching to detect reverification fields
+                    doc_title_matches = matcher.find_document_title_fields(extracted)
+                    has_reverification_doc = any('reverification' in field.lower() for field, _, _ in doc_title_matches)
+                    
+                    if has_reverification_doc or any('reverification' in key.lower() for key in extracted.keys()):
+                        # This is a Section 3 page even if title doesn't say so
+                        section_3_pages.append({'page': page, 'signature_date': latest_sig})
+                    else:
+                        # Standard I-9 page
+                        standard_i9_pages.append({'page': page, 'signature_date': latest_sig})
         
         # Apply Enhanced Business Rules Hierarchy with Validation
         selected_pages = None
@@ -506,6 +525,7 @@ class I9RubricProcessor:
     def _validate_supplement_b_pages(self, supplement_b_pages: List[Dict]) -> bool:
         """
         Validate if Supplement B pages contain meaningful data using fuzzy matching
+        Uses universal JSON flattening to handle ANY nested structure
         """
         if not supplement_b_pages:
             return False
@@ -516,17 +536,20 @@ class I9RubricProcessor:
             page = page_info['page']
             extracted = page.get('extracted_values', {})
             
-            # Use fuzzy matching to find signature fields
-            signature_matches = matcher.find_signature_fields(extracted)
+            # Flatten any nested structure - handles reverification_blocks or ANY future structure
+            flattened = flatten_extracted_values(extracted)
+            
+            # Use fuzzy matching on flattened data
+            signature_matches = matcher.find_signature_fields(flattened)
             has_signature = len(signature_matches) > 0
             
             # Use fuzzy matching to find content fields
-            document_matches = matcher.find_document_title_fields(extracted)
+            document_matches = matcher.find_document_title_fields(flattened)
             name_matches = [
-                matcher.find_name_field(extracted, 'first_name'),
-                matcher.find_name_field(extracted, 'last_name')
+                matcher.find_name_field(flattened, 'first_name'),
+                matcher.find_name_field(flattened, 'last_name')
             ]
-            expiry_matches = matcher.find_expiry_date_fields(extracted)
+            expiry_matches = matcher.find_expiry_date_fields(flattened)
             
             has_content = (len(document_matches) > 0 or 
                           any(name_matches) or 
@@ -542,6 +565,7 @@ class I9RubricProcessor:
     def _validate_section_3_pages(self, section_3_pages: List[Dict]) -> bool:
         """
         Validate if Section 3 pages contain meaningful data using fuzzy matching
+        Uses universal JSON flattening to handle ANY nested structure
         """
         if not section_3_pages:
             return False
@@ -552,13 +576,16 @@ class I9RubricProcessor:
             page = page_info['page']
             extracted = page.get('extracted_values', {})
             
-            # Use fuzzy matching to find signature fields
-            signature_matches = matcher.find_signature_fields(extracted)
+            # Flatten any nested structure - handles section_3_blocks or ANY future structure
+            flattened = flatten_extracted_values(extracted)
+            
+            # Use fuzzy matching on flattened data
+            signature_matches = matcher.find_signature_fields(flattened)
             has_signature = len(signature_matches) > 0
             
             # Use fuzzy matching to find content fields
-            document_matches = matcher.find_document_title_fields(extracted)
-            expiry_matches = matcher.find_expiry_date_fields(extracted)
+            document_matches = matcher.find_document_title_fields(flattened)
+            expiry_matches = matcher.find_expiry_date_fields(flattened)
             
             has_content = len(document_matches) > 0 or len(expiry_matches) > 0
             
@@ -572,6 +599,7 @@ class I9RubricProcessor:
     def _validate_standard_i9_pages(self, standard_i9_pages: List[Dict]) -> bool:
         """
         Validate if Standard I-9 pages contain meaningful data using fuzzy matching
+        Uses universal JSON flattening to handle ANY nested structure
         """
         if not standard_i9_pages:
             return False
@@ -582,15 +610,18 @@ class I9RubricProcessor:
             page = page_info['page']
             extracted = page.get('extracted_values', {})
             
-            # Use fuzzy matching to find signature fields
-            signature_matches = matcher.find_signature_fields(extracted)
+            # Flatten any nested structure for consistency
+            flattened = flatten_extracted_values(extracted)
+            
+            # Use fuzzy matching on flattened data
+            signature_matches = matcher.find_signature_fields(flattened)
             has_signature = len(signature_matches) > 0
             
             # Use fuzzy matching to find content fields
-            document_matches = matcher.find_document_title_fields(extracted)
+            document_matches = matcher.find_document_title_fields(flattened)
             name_matches = [
-                matcher.find_name_field(extracted, 'first_name'),
-                matcher.find_name_field(extracted, 'last_name')
+                matcher.find_name_field(flattened, 'first_name'),
+                matcher.find_name_field(flattened, 'last_name')
             ]
             
             has_content = len(document_matches) > 0 or any(name_matches)
@@ -617,31 +648,79 @@ class I9RubricProcessor:
         }
         
         pages = catalog_data.get('document_catalog', {}).get('pages', catalog_data.get('pages', []))
+        form_type = bucket_3_data.get('selected_form_type', 'new_hire')
+        selected_signature_date = bucket_3_data.get('selected_form_signature_date', '')
         
-        # Find work authorization expiry from Section 1
-        for page in pages:
-            page_title = page.get('page_title', '').lower()
-            extracted = page.get('extracted_values', {})
-            
-            if 'section 1' in page_title or 'employment eligibility' in page_title:
-                work_auth_fields = [
-                    extracted.get('work_auth_expiration_date'),
-                    extracted.get('work_until_date'),
-                    extracted.get('work_authorization_expiration_date'),
-                    extracted.get('alien_authorized_to_work_until'),
-                    extracted.get('alien_authorized_to_work_until_date'),
-                    extracted.get('alien_expiration_date')
-                ]
+        # For Section 3 cases, find the Section 1 page that corresponds to the selected Section 3
+        if form_type == 'reverification_section_3' and selected_signature_date:
+            # Find the Section 3 page with the selected signature date
+            section3_page_num = None
+            for i, page in enumerate(pages):
+                page_title = page.get('page_title', '').lower()
+                extracted = page.get('extracted_values', {})
                 
-                for work_auth in work_auth_fields:
-                    if work_auth and work_auth not in ['N/A', '', None]:
-                        data['work_auth_expiry_date'] = str(work_auth)
-                        data['work_auth_expiry_found'] = True
-                        score += 8  # Work Auth Expiry Date Found
+                if 'section 3' in page_title or 'reverification' in page_title or any('reverif' in k.lower() for k in extracted.keys()):
+                    # Check if this page has the selected signature date
+                    sig_matches = self.fuzzy_matcher.find_signature_fields(extracted)
+                    for _, sig_date, _ in sig_matches:
+                        if sig_date == selected_signature_date:
+                            section3_page_num = i
+                            break
+                    if section3_page_num is not None:
                         break
+            
+            # Find the closest Section 1 page before the Section 3 page
+            if section3_page_num is not None:
+                for i in range(section3_page_num - 1, -1, -1):  # Search backwards from Section 3
+                    page = pages[i]
+                    page_title = page.get('page_title', '').lower()
+                    extracted = page.get('extracted_values', {})
+                    
+                    if 'section 1' in page_title:
+                        work_auth_fields = [
+                            extracted.get('work_auth_expiration_date'),
+                            extracted.get('work_until_date'),
+                            extracted.get('work_authorization_expiration_date'),
+                            extracted.get('alien_authorized_to_work_until'),
+                            extracted.get('alien_authorized_to_work_until_date'),
+                            extracted.get('alien_expiration_date')
+                        ]
+                        
+                        for work_auth in work_auth_fields:
+                            if work_auth and work_auth not in ['N/A', '', None]:
+                                data['work_auth_expiry_date'] = str(work_auth)
+                                data['work_auth_expiry_found'] = True
+                                score += 8  # Work Auth Expiry Date Found
+                                break
+                        
+                        if data['work_auth_expiry_found']:
+                            break
+        
+        # If not found (or not Section 3), use standard Section 1 search
+        if not data['work_auth_expiry_found']:
+            for page in pages:
+                page_title = page.get('page_title', '').lower()
+                extracted = page.get('extracted_values', {})
                 
-                if data['work_auth_expiry_found']:
-                    break
+                if 'section 1' in page_title or 'employment eligibility' in page_title:
+                    work_auth_fields = [
+                        extracted.get('work_auth_expiration_date'),
+                        extracted.get('work_until_date'),
+                        extracted.get('work_authorization_expiration_date'),
+                        extracted.get('alien_authorized_to_work_until'),
+                        extracted.get('alien_authorized_to_work_until_date'),
+                        extracted.get('alien_expiration_date')
+                    ]
+                    
+                    for work_auth in work_auth_fields:
+                        if work_auth and work_auth not in ['N/A', '', None]:
+                            data['work_auth_expiry_date'] = str(work_auth)
+                            data['work_auth_expiry_found'] = True
+                            score += 8  # Work Auth Expiry Date Found
+                            break
+                    
+                    if data['work_auth_expiry_found']:
+                        break
         
         # Find document expiry from appropriate sections
         form_type = bucket_3_data.get('form_type_detected', 'NONE')
@@ -936,27 +1015,43 @@ class I9RubricProcessor:
                     if alien_reg and alien_reg not in ['N/A', '', None]:
                         business_fields['alien_registration_number'] = str(alien_reg)
         
-        # Enhanced I-9 set detection - group pages by signature dates
+        # Enhanced I-9 set detection - group pages by signature dates and form sets
         i9_sets = {}  # signature_date -> {pages: [], type: '', documents: []}
+        i9_form_pages = {}  # Track I-9 pages by form version/date to group Section 1 + Section 2
         
+        # First pass: identify all I-9 pages and their relationships
         for page in pages:
             page_title = page.get('page_title', '').lower()
             extracted = page.get('extracted_values', {})
             page_num = page.get('page_number')
+            form_version = extracted.get('form_version', '')
             
             # Only process I-9 related pages
             if any(term in page_title for term in ['i-9', 'employment eligibility', 'section 1', 'section 2', 'section 3', 'supplement']):
-                # Check for signature dates
-                sig_fields = [
-                    ('employer_signature_date', extracted.get('employer_signature_date')),
-                    ('date_of_employer_signature', extracted.get('date_of_employer_signature')),
-                    ('reverification_date_signed', extracted.get('reverification_date_signed')),
-                    ('reverification_signature_date', extracted.get('reverification_signature_date')),
-                    ('employee_signature_date', extracted.get('employee_signature_date'))
-                ]
+                # Use fuzzy matching to find ALL signature date fields
+                sig_fields_raw = self.fuzzy_matcher.find_signature_fields(extracted)
+                # Filter to only include actual date values (MM/DD/YYYY format)
+                # AND exclude non-signature date fields like date_of_birth
+                sig_fields = [(fn, val, conf) for fn, val, conf in sig_fields_raw 
+                             if self._is_valid_date_format(str(val)) and 
+                             'birth' not in fn.lower() and 'dob' not in fn.lower() and
+                             'expir' not in fn.lower() and 'valid' not in fn.lower()]
                 
-                for field_name, sig_date in sig_fields:
+                # Track form sets by version to group Section 1 + Section 2
+                if 'section 1' in page_title or 'section 2' in page_title:
+                    if form_version not in i9_form_pages:
+                        i9_form_pages[form_version] = {'section_1': None, 'section_2': None, 'pages': []}
+                    
+                    if 'section 1' in page_title:
+                        i9_form_pages[form_version]['section_1'] = page
+                    if 'section 2' in page_title:
+                        i9_form_pages[form_version]['section_2'] = page
+                    i9_form_pages[form_version]['pages'].append(page_num)
+                
+                for field_name, sig_date, confidence in sig_fields:
                     if sig_date and sig_date not in ['N/A', '', None]:
+                        # Ensure sig_date is a string (not dict or other type)
+                        sig_date = str(sig_date) if not isinstance(sig_date, str) else sig_date
                         if sig_date not in i9_sets:
                             i9_sets[sig_date] = {
                                 'pages': [],
@@ -973,6 +1068,23 @@ class I9RubricProcessor:
                         elif 'section 3' in page_title or 'reverification' in page_title:
                             i9_sets[sig_date]['type'] = 'Section 3'
         
+        # Second pass: Add form sets where Section 1 is unsigned but Section 2 is signed
+        for form_version, form_data in i9_form_pages.items():
+            if form_data['section_2']:
+                # Section 2 exists, check if it has a signature
+                sec2_extracted = form_data['section_2'].get('extracted_values', {})
+                sec2_sig = sec2_extracted.get('employer_signature_date') or sec2_extracted.get('date_of_employer_signature')
+                
+                if sec2_sig and sec2_sig not in ['N/A', '', None]:
+                    # This is a valid I-9 set even if Section 1 is unsigned
+                    if sec2_sig not in i9_sets:
+                        i9_sets[sec2_sig] = {
+                            'pages': [f"Page {p}" for p in form_data['pages']],
+                            'type': 'Standard I-9',
+                            'documents': [],
+                            'signature_field': 'employer_signature_date'
+                        }
+        
         business_fields['total_i9_sets_found'] = len(i9_sets)
         
         # Create detailed summary of all I-9 sets
@@ -984,8 +1096,24 @@ class I9RubricProcessor:
         business_fields['all_i9_sets_found'] = ' | '.join(all_sets_details)
         
         # Find the primary (latest) I-9 set
-        if i9_sets:
-            latest_date = max(i9_sets.keys())
+        # CRITICAL: Use bucket_3 selection if available (it uses proper business rules)
+        # Only fall back to max date if bucket_3 didn't select anything
+        if bucket_3_data.get('selected_form_signature_date'):
+            # Use bucket 3's selection (it already applied business rules and validation)
+            business_fields['primary_i9_set_signature_date'] = bucket_3_data.get('selected_form_signature_date')
+            # Find the corresponding set info
+            selected_date = bucket_3_data.get('selected_form_signature_date')
+            if selected_date in i9_sets:
+                primary_set = i9_sets[selected_date]
+                business_fields['primary_i9_set_type'] = primary_set['type']
+                business_fields['primary_i9_set_pages'] = ' | '.join(set(primary_set['pages']))
+            else:
+                # Set info not found, use bucket 3 data
+                business_fields['primary_i9_set_type'] = bucket_3_data.get('selected_form_type', 'NONE')
+                business_fields['primary_i9_set_pages'] = bucket_3_data.get('form_type_source_page', '')
+        elif i9_sets:
+            # Fallback: find latest using proper date comparison
+            latest_date = max(i9_sets.keys(), key=lambda d: self._parse_date_for_comparison(d))
             primary_set = i9_sets[latest_date]
             business_fields['primary_i9_set_signature_date'] = latest_date
             business_fields['primary_i9_set_type'] = primary_set['type']
@@ -1010,12 +1138,11 @@ class I9RubricProcessor:
                 page_title = page.get('page_title', '').lower()
                 extracted = page.get('extracted_values', {})
                 if 'section 3' in page_title or 'reverification' in page_title:
-                    # Get signature date from this page
-                    sig_dates = [
-                        extracted.get('employer_signature_date'),
-                        extracted.get('reverification_signature_date'),
-                        extracted.get('reverification_date_signed')
-                    ]
+                    # Use fuzzy matching to find signature dates
+                    sig_matches = self.fuzzy_matcher.find_signature_fields(extracted)
+                    # Filter to only valid dates (exclude names like "Fatima Yamin")
+                    sig_dates = [sig_date for field_name, sig_date, _ in sig_matches 
+                                if self._is_valid_date_format(str(sig_date)) and '_name' not in field_name.lower()]
                     latest_sig = None
                     for sig_date in sig_dates:
                         if sig_date and sig_date not in ['N/A', '', None]:
@@ -1037,12 +1164,11 @@ class I9RubricProcessor:
                 page_title = page.get('page_title', '').lower()
                 extracted = page.get('extracted_values', {})
                 if 'supplement b' in page_title:
-                    # Get signature date from this page
-                    sig_dates = [
-                        extracted.get('employer_signature_date'),
-                        extracted.get('reverification_signature_date'),
-                        extracted.get('reverification_1_signature_date')
-                    ]
+                    # Use fuzzy matching to find signature dates
+                    sig_matches = self.fuzzy_matcher.find_signature_fields(extracted)
+                    # Filter to only valid dates (exclude names)
+                    sig_dates = [sig_date for field_name, sig_date, _ in sig_matches 
+                                if self._is_valid_date_format(str(sig_date)) and '_name' not in field_name.lower()]
                     latest_sig = None
                     for sig_date in sig_dates:
                         if sig_date and sig_date not in ['N/A', '', None]:
@@ -1070,52 +1196,31 @@ class I9RubricProcessor:
             extracted = page.get('extracted_values', {})
             
             # Comprehensive document field variations found in analysis
-            # Determine which document fields to extract based on form type
-            if form_type == 'reverification_section_3' or form_type == 're-verification':
-                # For Section 3/Reverification: ONLY extract Section 3 documents
-                doc_fields = [
-                    'section_3_document_title',
-                    'reverification_document_title',
-                    'reverification_1_document_title', 'reverification_2_document_title', 'reverification_3_document_title',
-                    # Additional variations found in catalogs (e.g., Page 12 of Wu, Qianyi)
-                    'document_title_list_a_1', 'document_title_list_a_2', 'document_title_list_a_3',
-                    'document_title_list_b_1', 'document_title_list_b_2',
-                    'document_title_list_c_1', 'document_title_list_c_2'
-                ]
-            elif form_type == 'rehire_supplement_b' or form_type == 're-hire':
-                # For Supplement B: Extract reverification documents
-                doc_fields = [
-                    'reverification_document_title',
-                    'reverification_1_document_title', 'reverification_2_document_title', 'reverification_3_document_title'
-                ]
-            else:
-                # For Standard I-9: Extract Section 2 documents (List A/B/C)
-                doc_fields = [
-                    'list_a_document_title', 'list_b_document_title', 'list_c_document_title',
-                    # Numbered variations
-                    'list_a_document_1_title', 'list_a_document_2_title', 'list_a_document_3_title',
-                    'list_b_document_1_title', 'list_b_document_2_title', 'list_b_document_3_title',
-                    'list_c_document_1_title', 'list_c_document_2_title', 'list_c_document_3_title',
-                    # Underscore variations
-                    'list_a_document_title_1', 'list_a_document_title_2', 'list_a_document_title_3',
-                    'list_b_document_title_1', 'list_b_document_title_2', 'list_b_document_title_3',
-                    'list_c_document_title_1', 'list_c_document_title_2', 'list_c_document_title_3',
-                    # Section 2 specific
-                    'section_2_list_a_document_title', 'section_2_list_b_document_title', 'section_2_list_c_document_title'
-                ]
+            # Use fuzzy matching to find ALL document title fields
+            doc_matches_raw = self.fuzzy_matcher.find_document_title_fields(extracted)
             
-            for field in doc_fields:
-                doc_title = extracted.get(field)
+            # Filter out document number fields and date values (they should not be treated as separate documents)
+            doc_matches = [(fn, val, conf) for fn, val, conf in doc_matches_raw 
+                          if 'number' not in fn.lower() and 
+                          'issuing' not in fn.lower() and
+                          not self._is_valid_date_format(str(val)) and  # Exclude date values
+                          not self._is_only_number_or_code(str(val))]  # Exclude pure numbers/codes
+            
+            for field_name, doc_title, confidence in doc_matches:
                 if doc_title and doc_title not in ['N/A', '', None]:
-                    # Try multiple number field variations
-                    number_variations = [
-                        field.replace('title', 'number'),
-                        field.replace('_title', '_number'),
-                        field.replace('document_title', 'document_number')
+                    # Try to find corresponding document number using fuzzy matching
+                    # Look for fields that are similar to the title field but with 'number' instead
+                    doc_number = ''
+                    
+                    # Generate possible number field variations
+                    number_field_candidates = [
+                        field_name.replace('title', 'number'),
+                        field_name.replace('_title', '_number'),
+                        field_name.replace('document_title', 'document_number'),
+                        'document_number'  # Generic fallback
                     ]
                     
-                    doc_number = ''
-                    for num_field in number_variations:
+                    for num_field in number_field_candidates:
                         num_val = extracted.get(num_field)
                         if num_val and num_val not in ['N/A', '', None]:
                             doc_number = num_val
@@ -1138,18 +1243,42 @@ class I9RubricProcessor:
         
         business_fields['supporting_documents_count'] = supporting_docs
         
-        # Extract document expiry dates and matching information
+        # Extract document expiry dates and matching information - Check ALL pages including support documents
         doc_expiry_dates = []
         for page in pages:
             page_title = page.get('page_title', '').lower()
             extracted = page.get('extracted_values', {})
             
+            # Check Section 2 pages for List A/B/C document expiry dates
             if 'section 2' in page_title or 'employment eligibility' in page_title:
                 expiry_fields = [
                     'list_a_document_1_expiration_date', 'list_a_document_2_expiration_date', 'list_a_document_3_expiration_date',
                     'list_a_expiration_date', 'list_b_expiration_date', 'list_c_expiration_date'
                 ]
                 for field in expiry_fields:
+                    expiry = extracted.get(field)
+                    if expiry and expiry not in ['N/A', '', None]:
+                        doc_expiry_dates.append(expiry)
+            
+            # Check DS-2019 forms for program end dates
+            if 'ds-2019' in page_title or 'certificate of eligibility' in page_title:
+                ds2019_expiry_fields = [
+                    'form_period_to', 'form_covers_period_to', 'program_end_date'
+                ]
+                for field in ds2019_expiry_fields:
+                    expiry = extracted.get(field)
+                    if expiry and expiry not in ['N/A', '', None]:
+                        # Normalize date format from MM-DD-YYYY to MM/DD/YYYY
+                        expiry_normalized = str(expiry).replace('-', '/')
+                        doc_expiry_dates.append(expiry_normalized)
+            
+            # Check Supplement B for document expiry dates
+            if 'supplement b' in page_title:
+                supp_b_expiry_fields = [
+                    'document_expiration_date', 'reverification_1_document_expiration_date',
+                    'reverification_2_document_expiration_date', 'reverification_3_document_expiration_date'
+                ]
+                for field in supp_b_expiry_fields:
                     expiry = extracted.get(field)
                     if expiry and expiry not in ['N/A', '', None]:
                         doc_expiry_dates.append(expiry)
@@ -1212,7 +1341,30 @@ class I9RubricProcessor:
             page_num = page.get('page_number')
             
             # Skip I-9 form pages and lists of acceptable documents
-            if not any(term in page_title for term in ['i-9', 'employment eligibility', 'section', 'supplement', 'lists of acceptable']):
+            # CRITICAL: Use word boundaries to distinguish "i-9" from "i-94"
+            import re
+            
+            # Check if page contains "i-9" but NOT "i-94" using word boundaries
+            # This ensures "Form I-94" is NOT matched as "Form I-9"
+            has_i9 = bool(re.search(r'\bi-9\b', page_title))  # Word boundary ensures exact match
+            has_i94 = bool(re.search(r'\bi-94\b', page_title))  # Also use word boundary for i-94
+            
+            is_i9_form = (
+                has_i9 and not has_i94  # Has i-9 but not i-94
+            )
+            
+            is_i9_related = (
+                is_i9_form or
+                ('section 1' in page_title and has_i9) or
+                ('section 2' in page_title and has_i9) or
+                ('section 3' in page_title and has_i9) or
+                'supplement a' in page_title or
+                'supplement b' in page_title or
+                'lists of acceptable' in page_title or
+                'preparer and/or translator' in page_title
+            )
+            
+            if not is_i9_related:
                 supporting_pages.append({
                     'page_num': page_num,
                     'title': page_title,
@@ -1301,6 +1453,51 @@ class I9RubricProcessor:
             return True
         
         return False
+    
+    def _is_only_number_or_code(self, value: str) -> bool:
+        """Check if string is only a number or alphanumeric code (not a document title)"""
+        import re
+        if not value or not isinstance(value, str):
+            return False
+        
+        value = value.strip()
+        
+        # Check if it's purely numeric (with optional dashes/spaces)
+        # Examples: "31311478", "200-76-8781", "532212165"
+        if re.match(r'^[\d\s\-]+$', value):
+            return True
+        
+        # Check if it's a short alphanumeric code (less than 15 chars, mostly numbers)
+        # Examples: "A02730709", "RE0920344079", "FZ586052"
+        if len(value) < 15:
+            # Count digits vs letters
+            digit_count = sum(c.isdigit() for c in value)
+            letter_count = sum(c.isalpha() for c in value)
+            # If mostly numbers (>60% digits), it's likely a code
+            if digit_count > 0 and digit_count / len(value) > 0.6:
+                return True
+        
+        return False
+    
+    def _is_valid_date_format(self, date_str: str) -> bool:
+        """Check if string is a valid date in MM/DD/YYYY or MM-DD-YYYY format"""
+        import re
+        if not date_str or not isinstance(date_str, str):
+            return False
+        
+        # Check for MM/DD/YYYY or MM-DD-YYYY format
+        date_pattern = r'^\d{1,2}[/-]\d{1,2}[/-]\d{4}$'
+        if not re.match(date_pattern, date_str):
+            return False
+        
+        # Try to parse it to ensure it's a valid date
+        try:
+            # Normalize separators
+            normalized = date_str.replace('-', '/')
+            datetime.strptime(normalized, '%m/%d/%Y')
+            return True
+        except:
+            return False
     
     def _parse_date_for_comparison(self, date_str: str):
         """Parse date string for comparison purposes"""
@@ -1746,7 +1943,8 @@ class I9RubricProcessor:
         ]
         
         with open(output_path, 'w', newline='', encoding='utf-8') as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction='ignore')
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction='ignore', 
+                                   quoting=csv.QUOTE_ALL)  # Quote all fields
             writer.writeheader()
             
             for result in results:

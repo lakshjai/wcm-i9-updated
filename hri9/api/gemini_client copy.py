@@ -47,9 +47,7 @@ class GeminiClient:
         try:
             client = OpenAI(
                 api_key=self.api_key,
-                base_url=self.base_url,
-                timeout=120.0,  # 2 minute timeout for large documents
-                max_retries=2   # Built-in retry logic
+                base_url=self.base_url
             )
             logger.info(f"Initialized Gemini API client with model: {self.model}")
             return client
@@ -258,17 +256,8 @@ class GeminiClient:
         # Prepare specialized catalog analysis prompt
         system_prompt = self._get_catalog_analysis_prompt()
         
-        # Prepare user message with emphasis on small text extraction
-        user_message = f"""Please analyze page {page_number} of this document and provide a comprehensive analysis in the specified JSON format.
-
-CRITICAL: This document may contain small print text. Pay special attention to:
-- Fine print in document headers and footers (form versions, revision dates)
-- Small text in form fields and labels
-- Document numbers, expiration dates, and issue dates in small fonts
-- Instructions, legal text, and disclaimers in reduced font sizes
-- Handwritten entries that may be small or unclear
-
-Extract ALL visible text regardless of font size. If text is too small to read clearly, note it as "illegible" rather than omitting it."""
+        # Prepare user message
+        user_message = f"Please analyze page {page_number} of this document and provide a comprehensive analysis in the specified JSON format."
         
         # Prepare messages for API call
         messages = self._prepare_catalog_messages(system_prompt, user_message, text, image_base64)
@@ -290,7 +279,7 @@ Extract ALL visible text regardless of font size. If text is too small to read c
                 response = self.client.chat.completions.create(
                     model=self.model,
                     messages=messages,
-                    temperature=0.0,
+                    temperature=0.1,
                     max_tokens=8192
                 )
                 
@@ -349,229 +338,88 @@ Extract ALL visible text regardless of font size. If text is too small to read c
         Returns:
             str: System prompt for catalog analysis.
         """
-        return """You are a precise document data extraction system specialized in HR and immigration documents.
+        return """You are a precise document analyzer. Extract information EXACTLY as it appears in the document.
 
-CRITICAL INSTRUCTIONS - READ CAREFULLY:
-
-You are analyzing HR employment verification documents, primarily I-9 forms and supporting immigration/identity documents. Your task is to extract ALL visible fields from each page with absolute precision.
-
-EXTRACTION RULES (MANDATORY):
-1. Extract text EXACTLY as written - preserve spelling, punctuation, formatting, and case
-2. NEVER infer, assume, or fill in missing information
-3. NEVER interpret abbreviations or correct apparent errors
-4. If text is unclear/illegible, mark as \"illegible\" - do NOT guess
-5. For handwritten text, transcribe as accurately as possible; if uncertain, note \"uncertain: [best attempt]\"
-6. Extract ALL fields present, even if partially filled or crossed out
-7. For checkboxes: indicate \"checked\", \"unchecked\", or \"unclear\"
-8. Preserve dates in their original format (do not standardize)
-9. If a field exists but is empty/blank, mark as \"blank\" or \"not_filled\"
-10. Do NOT add commentary, explanations, or metadata beyond the structured output
-
-DOCUMENT TYPES YOU MAY ENCOUNTER:
-
-A. I-9 FORMS (Employment Eligibility Verification):
-   - Form versions span multiple decades (1980s-2020s) - formats vary significantly
-   - Sections to identify and extract:
-     * Section 1: Employee Information and Attestation
-     * Section 2: Employer Review and Verification
-     * Section 3: Reverification and Rehires
-   - Additional schedules: Schedule A, Schedule B (if present)
-
-B. SUPPORTING IDENTITY/IMMIGRATION DOCUMENTS:
-   - U.S. Passports / Passport Cards
-   - Driver's Licenses / State IDs
-   - Social Security Cards
-   - Birth Certificates
-   - I-94 Arrival/Departure Records
-   - I-551 (Permanent Resident Cards/Green Cards)
-   - Employment Authorization Documents (EAD)
-   - Foreign Passports with visa stamps
-   - Other immigration papers (specify type if identifiable)
-
-EXTRACTION APPROACH FOR EACH PAGE:
-
-1. IDENTIFY DOCUMENT TYPE:
-   - State the specific document type (e.g., \"I-9 Section 1\", \"U.S. Passport\", \"Driver License\")
-   - Identify form version/revision date if visible
-   - Note page number if present
-
-2. EXTRACT ALL VISIBLE FIELDS:
-   For structured forms (I-9s, IDs):
-   - Map each label/field name to its corresponding value
-   - Include pre-printed field labels exactly as shown
-   
-   For semi-structured documents:
-   - Extract all text elements with their apparent purpose
-   - Maintain spatial/logical relationships when possible
-
-3. HANDLE VARIATIONS:
-   - Historical I-9 forms: Field names and layouts differ across versions - extract whatever fields exist
-   - Handwritten entries: Transcribe carefully, flag uncertainty
-   - Multi-language documents: Extract in original language
-   - Amended/corrected entries: Capture both original and corrected values if visible
-
-4. SPECIAL CASES:
-   - Signatures: Note \"signature present\" with date if shown (do NOT attempt to read signature names unless printed)
-   - Stamps/seals: Describe what's visible (e.g., \"official stamp present\", \"notary seal\")
-   - Photographs: Note \"photo present\" (do NOT describe the person)
-   - Barcodes/QR codes: Note presence but do NOT attempt to decode
-   - Crossed-out information: Include with note \"crossed_out: [text]\"
-
-OUTPUT FORMAT - MANDATORY STRUCTURE:
-
-Return ONLY a valid JSON object. NO markdown, NO code blocks, NO explanations.
-Use this EXACT structure:
-
-{
-  \"page_title\": \"<EXACT title from document header>\",
-  \"page_type\": \"government_form|identity_document|employment_record|other\",
-  \"page_subtype\": \"i9_form|passport|drivers_license|social_security_card|birth_certificate|employment_contract|tax_form|other\",
-  \"confidence_score\": 0.95,
-  \"extracted_values\": {
-    \"first_name\": \"<exact value or null>\",
-    \"middle_name\": \"<exact value or null>\",
-    \"last_name\": \"<exact value or null>\",
-    \"date_of_birth\": \"MM/DD/YYYY or null\",
-    \"ssn\": \"XXX-XX-XXXX or null\",
-    \"employee_signature_date\": \"MM/DD/YYYY or null\",
-    \"employer_signature_date\": \"MM/DD/YYYY or null\",
-    \"form_version\": \"<exact version string or null>\",
-    \"section_type\": \"section_1|section_2|section_3|supplement_b or null\",
-    \"citizenship_status\": \"<exact checkbox text or null>\",
-    \"work_authorization_expiry_date\": \"MM/DD/YYYY or null\",
-    \"alien_registration_number\": \"<exact number or null>\",
-    \"list_a_document_title\": \"<exact name or null>\",
-    \"list_a_document_number\": \"<exact number or null>\",
-    \"list_a_expiration_date\": \"MM/DD/YYYY or null>\",
-    \"list_b_document_title\": \"<exact name or null>\",
-    \"list_b_document_number\": \"<exact number or null>\",
-    \"list_c_document_title\": \"<exact name or null>\",
-    \"list_c_document_number\": \"<exact number or null>\",
-    \"reverification_document_title\": \"<exact name or null>\",
-    \"reverification_document_number\": \"<exact number or null>\",
-    \"reverification_expiration_date\": \"MM/DD/YYYY or null>\",
-    \"reverification_signature_date\": \"MM/DD/YYYY or null>\",
-    \"first_day_of_employment\": \"MM/DD/YYYY or null>\",
-    \"rehire_date\": \"MM/DD/YYYY or null>\"
-  },
-  \"text_regions\": [],
-  \"page_metadata\": {
-    \"has_handwritten_text\": true,
-    \"has_signatures\": true,
-    \"image_quality\": \"high|medium|low\",
-    \"language\": \"en\",
-    \"form_version\": \"<exact version or null>\",
-    \"security_features\": [],
-    \"text_extraction_method\": \"hybrid\"
-  }
-}
-
-EXAMPLES - Study these carefully:
-
-EXAMPLE 1 - I-9 Section 1:
-{
-  \"page_title\": \"Form I-9 Employment Eligibility Verification Section 1\",
-  \"page_type\": \"government_form\",
-  \"page_subtype\": \"i9_form\",
-  \"confidence_score\": 0.95,
-  \"extracted_values\": {
-    \"first_name\": \"John\",
-    \"middle_name\": \"A\",
-    \"last_name\": \"Smith\",
-    \"date_of_birth\": \"05/15/1985\",
-    \"ssn\": \"123-45-6789\",
-    \"employee_signature_date\": \"08/01/2023\",
-    \"form_version\": \"07/17/2017\",
-    \"section_type\": \"section_1\",
-    \"citizenship_status\": \"A citizen of the United States\",
-    \"work_authorization_expiry_date\": null,
-    \"alien_registration_number\": null
-  },
-  \"text_regions\": [],
-  \"page_metadata\": {
-    \"has_handwritten_text\": true,
-    \"has_signatures\": true,
-    \"image_quality\": \"high\",
-    \"language\": \"en\",
-    \"form_version\": \"07/17/2017\",
-    \"security_features\": [],
-    \"text_extraction_method\": \"hybrid\"
-  }
-}
-
-EXAMPLE 2 - I-9 Section 2:
-{
-  \"page_title\": \"Form I-9 Section 2 Employer Review and Verification\",
-  \"page_type\": \"government_form\",
-  \"page_subtype\": \"i9_form\",
-  \"confidence_score\": 0.92,
-  \"extracted_values\": {
-    \"first_name\": \"John\",
-    \"last_name\": \"Smith\",
-    \"employer_signature_date\": \"08/02/2023\",
-    \"first_day_of_employment\": \"08/01/2023\",
-    \"form_version\": \"07/17/2017\",
-    \"section_type\": \"section_2\",
-    \"list_a_document_title\": \"U.S. Passport\",
-    \"list_a_document_number\": \"123456789\",
-    \"list_a_expiration_date\": \"06/15/2028\",
-    \"list_b_document_title\": null,
-    \"list_c_document_title\": null
-  },
-  \"text_regions\": [],
-  \"page_metadata\": {
-    \"has_handwritten_text\": true,
-    \"has_signatures\": true,
-    \"image_quality\": \"high\",
-    \"language\": \"en\",
-    \"form_version\": \"07/17/2017\",
-    \"security_features\": [],
-    \"text_extraction_method\": \"hybrid\"
-  }
-}
-
-EXAMPLE 3 - I-9 Section 3:
-{
-  \"page_title\": \"Form I-9 Section 3 Reverification and Rehires\",
-  \"page_type\": \"government_form\",
-  \"page_subtype\": \"i9_form\",
-  \"confidence_score\": 0.90,
-  \"extracted_values\": {
-    \"first_name\": \"John\",
-    \"last_name\": \"Smith\",
-    \"form_version\": \"07/17/2017\",
-    \"section_type\": \"section_3\",
-    \"reverification_document_title\": \"Employment Authorization Document\",
-    \"reverification_document_number\": \"ABC123456789\",
-    \"reverification_expiration_date\": \"12/31/2025\",
-    \"reverification_signature_date\": \"01/15/2024\",
-    \"rehire_date\": null
-  },
-  \"text_regions\": [],
-  \"page_metadata\": {
-    \"has_handwritten_text\": true,
-    \"has_signatures\": true,
-    \"image_quality\": \"medium\",
-    \"language\": \"en\",
-    \"form_version\": \"07/17/2017\",
-    \"security_features\": [],
-    \"text_extraction_method\": \"hybrid\"
-  }
-}
-
-CRITICAL REMINDERS:
+CRITICAL RULES:
 1. Return ONLY valid JSON - no markdown, no explanations, no code blocks
 2. Use null for missing values - NEVER use placeholder text like "N/A", "not present", "if present"
 3. Extract dates in MM/DD/YYYY format ONLY if clearly visible - use null if absent
 4. Extract text EXACTLY as written - do not paraphrase or interpret
 5. Be consistent - same document analyzed twice must produce identical output
-6. Ensure the JSON is valid and properly escaped
-7. Extract information AS-IS without interpretation
-8. When in doubt, mark as \"unclear\" or \"illegible\" rather than guessing
-9. Each page should generate ONE complete JSON object
 
-Begin extraction now."
-"""
+REQUIRED JSON STRUCTURE:
+{
+  "page_title": "EXACT title from document header (e.g., 'Form I-9 Section 1', 'U.S. Passport')",
+  "page_type": "government_form|identity_document|employment_record|other",
+  "page_subtype": "i9_form|passport|drivers_license|social_security_card|birth_certificate|employment_contract|tax_form|other",
+  "confidence_score": 0.95,
+  "extracted_values": {
+    "first_name": "EXACT first name or null",
+    "middle_name": "EXACT middle name/initial or null",
+    "last_name": "EXACT last name or null",
+    "date_of_birth": "MM/DD/YYYY or null",
+    "ssn": "XXX-XX-XXXX format or null",
+    "employee_signature_date": "MM/DD/YYYY or null",
+    "employer_signature_date": "MM/DD/YYYY or null",
+    "signature_date": "MM/DD/YYYY (use if role unclear) or null",
+    "form_version": "EXACT version string (e.g., 'Rev. 10/21/2019') or null",
+    "section_type": "section_1|section_2|section_3|supplement_b or null",
+    "citizenship_status": "EXACT checkbox text selected or null",
+    "work_authorization_expiry_date": "MM/DD/YYYY or null",
+    "alien_registration_number": "EXACT number or null",
+    "list_a_document_title": "EXACT document name or null",
+    "list_a_document_number": "EXACT number or null",
+    "list_a_expiration_date": "MM/DD/YYYY or null",
+    "list_b_document_title": "EXACT document name or null",
+    "list_b_document_number": "EXACT number or null",
+    "list_c_document_title": "EXACT document name or null",
+    "list_c_document_number": "EXACT number or null",
+    "reverification_document_title": "EXACT document name or null",
+    "reverification_document_number": "EXACT number or null",
+    "reverification_expiration_date": "MM/DD/YYYY or null",
+    "reverification_signature_date": "MM/DD/YYYY or null",
+    "rehire_date": "MM/DD/YYYY or null",
+    "first_day_of_employment": "MM/DD/YYYY or null"
+  },
+  "page_metadata": {
+    "has_handwritten_text": true,
+    "has_signatures": true,
+    "image_quality": "high|medium|low",
+    "language": "en",
+    "form_version": "EXACT version or null",
+    "security_features": [],
+    "text_extraction_method": "hybrid"
+  }
+}
+
+SECTION TYPE IDENTIFICATION (for I-9 forms):
+- section_1: Contains "Employee Information and Attestation", citizenship checkboxes, employee signature
+- section_2: Contains "Employer or Authorized Representative Review and Verification", List A/B/C documents, employer signature
+- section_3: Contains "Reverification and Rehires", new document fields, reverification signature
+- supplement_b: Contains "Preparer and/or Translator Certification"
+
+DATE EXTRACTION RULES:
+- ONLY extract if date is clearly visible and legible
+- Format: MM/DD/YYYY (e.g., "03/15/2023")
+- If handwritten and unclear, use null
+- Common date fields:
+  * employee_signature_date: Date next to employee signature (Section 1)
+  * employer_signature_date: Date next to employer/HR signature (Section 2 or 3)
+  * reverification_signature_date: Date in Section 3 reverification area
+  * first_day_of_employment: Employment start date (Section 2)
+  * work_authorization_expiry_date: "Alien Authorized to Work Until" date (Section 1)
+
+DOCUMENT EXTRACTION RULES:
+- Extract List A, B, C documents EXACTLY as written
+- Include document numbers EXACTLY as they appear
+- For Section 3: Extract NEW documents used for reverification
+- Use null if document field is blank
+
+CONSISTENCY REQUIREMENTS:
+- Same field names must always map to same document locations
+- Same document analyzed multiple times must produce identical JSON
+- Do not randomize or vary output structure
+- Confidence scores should be based on image clarity, not guesswork"""
     
     def _prepare_catalog_messages(self, system_prompt: str, user_message: str, text: str = None, image_base64: str = None) -> list:
         """
@@ -587,41 +435,12 @@ Begin extraction now."
             list: Formatted messages for API call.
         """
         if image_base64 and text:
-            # Combined text and image message (HYBRID APPROACH)
-            # This provides both extracted text (catches small fonts) and visual context
-            hybrid_message = f"""{user_message}
-
-HYBRID EXTRACTION MODE:
-You have BOTH extracted text and the visual image. Use this hybrid approach:
-
-1. **Primary Source - Extracted Text**: The text below was extracted from the PDF and contains ALL text including small fonts that may be hard to see in the image. Use this as your PRIMARY source for:
-   - Form versions and revision dates (often very small)
-   - Document numbers and expiration dates
-   - Names, addresses, and other typed/printed text
-   - Any text that appears small or unclear in the image
-
-2. **Secondary Source - Visual Image**: Use the image to:
-   - Verify checkbox states (checked/unchecked)
-   - Identify signatures and handwritten text
-   - Understand document layout and structure
-   - Cross-reference unclear text from extraction
-
-3. **Extraction Strategy**:
-   - If text is present in the extracted content below, use it EXACTLY as written
-   - If text is missing from extraction but visible in image, extract from image
-   - For handwritten content, rely on image since text extraction may miss it
-   - For checkboxes and signatures, rely on image
-
-EXTRACTED TEXT CONTENT:
-{text}
-
-Now analyze the image in combination with the extracted text above."""
-            
+            # Combined text and image message
             return [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": [
-                    {"type": "text", "text": hybrid_message},
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}"}}
+                    {"type": "text", "text": user_message + "\n\nText content:\n" + text},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}}
                 ]}
             ]
         elif image_base64:

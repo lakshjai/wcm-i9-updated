@@ -48,7 +48,7 @@ BATCH_SIZE = int(os.getenv("BATCH_SIZE", "10"))
 
 # Logging configuration
 LOG_FILE = os.getenv("LOG_FILE", os.path.join(OUTPUT_DIR, "i9_detection.log"))
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "DEBUG")
 
 # Ensure output directories exist
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -87,6 +87,17 @@ MAX_EXTRACTED_FIELDS = int(os.getenv("MAX_EXTRACTED_FIELDS", "50"))
 
 # I-9 specific analysis settings
 I9_ONLY_ANALYSIS = os.getenv("I9_ONLY_ANALYSIS", "True").lower() in ("true", "1", "yes")  # Only analyze I-9 forms in detail
+
+# PDF Image Processing Settings (for improved small text extraction)
+PDF_DPI = int(os.getenv("PDF_DPI", "300"))  # DPI for PDF to image conversion (higher = better quality)
+PDF_IMAGE_SCALE_FACTOR = float(os.getenv("I9_IMAGE_SCALE_FACTOR", "3.0"))  # Additional scaling factor
+PDF_IMAGE_FORMAT = os.getenv("PDF_IMAGE_FORMAT", "PNG").upper()  # Image format: PNG, JPEG
+PDF_IMAGE_QUALITY = int(os.getenv("PDF_IMAGE_QUALITY", "95"))  # JPEG quality (1-100), ignored for PNG
+
+# Hybrid Text + Vision Extraction (RECOMMENDED for small text)
+HYBRID_EXTRACTION_ENABLED = os.getenv("HYBRID_EXTRACTION_ENABLED", "True").lower() in ("true", "1", "yes")
+# When enabled, always extracts text first and provides it to LLM along with image
+# This ensures small text is captured even if image resolution is limited
 SKIP_NON_I9_EXTRACTION = os.getenv("SKIP_NON_I9_EXTRACTION", "True").lower() in ("true", "1", "yes")  # Skip data extraction for non-I9 pages
 
 # Batch processing settings
