@@ -652,7 +652,10 @@ class I9RubricProcessor:
         selected_signature_date = bucket_3_data.get('selected_form_signature_date', '')
         
         # For Section 3 cases, find the Section 1 page that corresponds to the selected Section 3
-        if form_type == 'reverification_section_3' and selected_signature_date:
+        # Use flexible matching for form type (handles variations)
+        is_section_3 = 'reverification' in form_type.lower() or 'section_3' in form_type.lower() or 'section 3' in form_type.lower()
+        
+        if is_section_3 and selected_signature_date:
             # Find the Section 3 page with the selected signature date
             section3_page_num = None
             for i, page in enumerate(pages):
@@ -724,6 +727,8 @@ class I9RubricProcessor:
         
         # Find document expiry from appropriate sections
         form_type = bucket_3_data.get('form_type_detected', 'NONE')
+        is_supplement_b = 'supplement' in form_type.lower() or 'rehire' in form_type.lower()
+        is_section_3_doc = 'reverification' in form_type.lower() or 'section_3' in form_type.lower() or 'section 3' in form_type.lower()
         
         for page in pages:
             page_title = page.get('page_title', '').lower()
@@ -731,9 +736,9 @@ class I9RubricProcessor:
             
             doc_expiry = None
             
-            if form_type == 'rehire_supplement_b' and 'supplement b' in page_title:
+            if is_supplement_b and 'supplement b' in page_title:
                 doc_expiry = extracted.get('reverification_1_expiration_date')
-            elif form_type == 'reverification_section_3' and ('section 3' in page_title or 'reverification' in page_title):
+            elif is_section_3_doc and ('section 3' in page_title or 'reverification' in page_title):
                 doc_expiry = (extracted.get('reverification_expiration_date') or 
                             extracted.get('section_3_expiration_date'))
             elif 'section 2' in page_title:
@@ -1129,9 +1134,13 @@ class I9RubricProcessor:
         
         # For Section 3 and Supplement B, we need to extract ONLY from the LATEST page
         # Build a list of pages to extract from based on form type
+        # Use flexible matching for form types
+        is_section_3_form = 'reverification' in form_type.lower() or 'section_3' in form_type.lower() or 'section 3' in form_type.lower()
+        is_supplement_b_form = 'supplement' in form_type.lower() or 'rehire' in form_type.lower()
+        
         pages_to_extract = []
         
-        if form_type == 'reverification_section_3' or form_type == 're-verification':
+        if is_section_3_form:
             # Find all Section 3 pages with signature dates
             section3_pages = []
             for page in pages:
@@ -1157,7 +1166,7 @@ class I9RubricProcessor:
                 latest_section3 = max(section3_pages, key=lambda x: self._parse_date_for_comparison(x['signature_date']))
                 pages_to_extract = [latest_section3['page']]
         
-        elif form_type == 'rehire_supplement_b' or form_type == 're-hire':
+        elif is_supplement_b_form:
             # Find all Supplement B pages with signature dates
             supplement_b_pages = []
             for page in pages:
