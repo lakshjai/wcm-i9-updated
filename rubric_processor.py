@@ -27,6 +27,55 @@ class I9RubricProcessor:
     def __init__(self):
         self.results = []
         self.fuzzy_matcher = FuzzyFieldMatcher(similarity_threshold=0.6)
+    
+    def _get_field_fuzzy(self, data_dict: Dict, field_patterns: List[str], default=None):
+        """
+        Get a field from a dictionary using fuzzy matching on field names.
+        
+        This is a universal helper that works for:
+        - Catalog extracted_values
+        - Bucket data dictionaries
+        - Business fields
+        - Any dictionary where field names might vary
+        
+        Args:
+            data_dict: Dictionary to search in
+            field_patterns: List of possible field name patterns (in priority order)
+            default: Default value if no match found
+            
+        Returns:
+            Value if found, default otherwise
+            
+        Example:
+            form_type = self._get_field_fuzzy(bucket_3_data, [
+                'selected_form_type',
+                'form_type_selected', 
+                'form_type',
+                'type'
+            ])
+        """
+        if not data_dict:
+            return default
+            
+        # Try exact matches first (fastest)
+        for pattern in field_patterns:
+            if pattern in data_dict:
+                value = data_dict[pattern]
+                if value and value not in ['N/A', '', None, 'null']:
+                    return value
+        
+        # Try fuzzy matching (case-insensitive substring matching)
+        for pattern in field_patterns:
+            pattern_lower = pattern.lower()
+            for key in data_dict.keys():
+                key_lower = key.lower()
+                # Check if pattern is in key or key is in pattern
+                if pattern_lower in key_lower or key_lower in pattern_lower:
+                    value = data_dict[key]
+                    if value and value not in ['N/A', '', None, 'null']:
+                        return value
+        
+        return default
         
     def process_catalog_file(self, catalog_path: str) -> Dict:
         """
@@ -51,7 +100,7 @@ class I9RubricProcessor:
             bucket_5_score, bucket_5_data = self._bucket_5_document_tracking(catalog_data, bucket_3_data)
             
             # Extract comprehensive business fields
-            business_fields = self._extract_comprehensive_business_fields(catalog_data, bucket_2_data, bucket_3_data)
+            business_fields = self._extract_comprehensive_business_fields(catalog_data, bucket_2_data, bucket_3_data, bucket_4_data)
             
             # Generate scoring reasons
             scoring_reasons = self._generate_scoring_reasons(
@@ -648,85 +697,174 @@ class I9RubricProcessor:
         }
         
         pages = catalog_data.get('document_catalog', {}).get('pages', catalog_data.get('pages', []))
-        form_type = bucket_3_data.get('selected_form_type', 'new_hire')
-        selected_signature_date = bucket_3_data.get('selected_form_signature_date', '')
         
-        # For Section 3 cases, find the Section 1 page that corresponds to the selected Section 3
+        # Use fuzzy matching for bucket fields
+        form_type = self._get_field_fuzzy(bucket_3_data, [
+            'selected_form_type',
+            'form_type_selected',
+            'form_type',
+            'type_selected'
+        ], default='new_hire')
+        
+        selected_signature_date = self._get_field_fuzzy(bucket_3_data, [
+            'selected_form_signature_date',
+            'form_signature_date',
+            'signature_date_selected',
+            'selected_signature_date',
+            'signature_date'
+        ], default='')
+        
+        # DEBUG LOGGING
+        logger.info(f"[BUCKET 4 DEBUG] form_type from fuzzy: '{form_type}'")
+        logger.info(f"[BUCKET 4 DEBUG] selected_signature_date from fuzzy: '{selected_signature_date}'")
+        logger.info(f"[BUCKET 4 DEBUG] bucket_3_data keys: {list(bucket_3_data.keys())}")
+        logger.info(f"[BUCKET 4 DEBUG] bucket_3_data values: {bucket_3_data}")
+        
+        # For Section 3 and Supplement B cases, find the Section 1 page that corresponds to the selected form
         # Use flexible matching for form type (handles variations)
-        is_section_3 = 'reverification' in form_type.lower() or 'section_3' in form_type.lower() or 'section 3' in form_type.lower()
+        form_type_normalized = form_type.lower().replace('-', '').replace('_', '')
+        is_section_3 = 'reverification' in form_type_normalized or 'section3' in form_type_normalized or 'section 3' in form_type.lower()
+        is_supplement_b = 'supplement' in form_type.lower() or 'rehire' in form_type_normalized
         
-        if is_section_3 and selected_signature_date:
-            # Find the Section 3 page with the selected signature date
-            section3_page_num = None
+        # Both Section 3 and Supplement B need backward search logic
+        needs_backward_search = is_section_3 or is_supplement_b
+        
+        logger.info(f"[BUCKET 4 DEBUG] is_section_3: {is_section_3}, is_supplement_b: {is_supplement_b}")
+        logger.info(f"[BUCKET 4 DEBUG] Condition met (needs_backward_search and selected_signature_date): {needs_backward_search and selected_signature_date}")
+        
+        if needs_backward_search and selected_signature_date:
+            logger.info(f"[BUCKET 4 DEBUG] ✅ Entering Section 3/Supplement B backward search logic")
+            # Find the Section 3 or Supplement B page with the selected signature date
+            target_page_num = None
             for i, page in enumerate(pages):
                 page_title = page.get('page_title', '').lower()
                 extracted = page.get('extracted_values', {})
                 
-                if 'section 3' in page_title or 'reverification' in page_title or any('reverif' in k.lower() for k in extracted.keys()):
+                # Check for Section 3 pages
+                is_section_3_page = ('section 3' in page_title or 'reverification' in page_title or 
+                                    any('reverif' in k.lower() for k in extracted.keys()))
+                # Check for Supplement B pages
+                is_supplement_b_page = 'supplement b' in page_title or any('supplement' in k.lower() for k in extracted.keys())
+                
+                if is_section_3_page or is_supplement_b_page:
                     # Check if this page has the selected signature date
                     sig_matches = self.fuzzy_matcher.find_signature_fields(extracted)
                     for _, sig_date, _ in sig_matches:
                         if sig_date == selected_signature_date:
-                            section3_page_num = i
+                            target_page_num = i
                             break
-                    if section3_page_num is not None:
+                    if target_page_num is not None:
                         break
             
-            # Find the closest Section 1 page before the Section 3 page
-            if section3_page_num is not None:
-                for i in range(section3_page_num - 1, -1, -1):  # Search backwards from Section 3
+            # Find the closest Section 1 page before the target page
+            if target_page_num is not None:
+                logger.info(f"[BUCKET 4 DEBUG] Found target form at page index {target_page_num} (Page {target_page_num + 1})")
+                logger.info(f"[BUCKET 4 DEBUG] Searching backwards from page {target_page_num}...")
+                
+                for i in range(target_page_num - 1, -1, -1):  # Search backwards from target form
                     page = pages[i]
                     page_title = page.get('page_title', '').lower()
                     extracted = page.get('extracted_values', {})
                     
-                    if 'section 1' in page_title:
-                        work_auth_fields = [
-                            extracted.get('work_auth_expiration_date'),
-                            extracted.get('work_until_date'),
-                            extracted.get('work_authorization_expiration_date'),
-                            extracted.get('alien_authorized_to_work_until'),
-                            extracted.get('alien_authorized_to_work_until_date'),
-                            extracted.get('alien_expiration_date')
-                        ]
+                    logger.info(f"[BUCKET 4 DEBUG] Checking Page {i+1}: {page.get('page_title')}")
+                    
+                    # Check if this is a Section 1 page by title OR by having Section 1 fields
+                    is_section_1_by_title = 'section 1' in page_title
+                    is_section_1_by_fields = any(field in extracted for field in [
+                        'employee_last_name', 'employee_first_name', 'employee_dob',
+                        'citizenship_status', 'work_authorization_expiration_date',
+                        'work_auth_expiration_date', 'employee_signature_date'
+                    ])
+                    
+                    if is_section_1_by_title or is_section_1_by_fields:
+                        logger.info(f"[BUCKET 4 DEBUG] ✅ Found Section 1 at Page {i+1}")
+                        # Use fuzzy matching for work auth fields
+                        work_auth = self._get_field_fuzzy(extracted, [
+                            'work_authorization_expiration_date',
+                            'work_auth_expiration_date',
+                            'work_until_date',
+                            'alien_authorized_to_work_until',
+                            'alien_authorized_to_work_until_date',
+                            'alien_expiration_date',
+                            'work_auth_expiry_date',
+                            'authorization_expiration_date'
+                        ])
+                        
+                        logger.info(f"[BUCKET 4 DEBUG] Work auth from fuzzy: '{work_auth}'")
+                        
+                        if work_auth:
+                            data['work_auth_expiry_date'] = str(work_auth)
+                            data['work_auth_expiry_found'] = True
+                            score += 8  # Work Auth Expiry Date Found
+                            logger.info(f"[BUCKET 4 DEBUG] ✅ Set work_auth_expiry_date to: {work_auth}")
+                        
+                        if data['work_auth_expiry_found']:
+                            break
+            else:
+                logger.info(f"[BUCKET 4 DEBUG] ❌ Target form (Section 3/Supplement B) page NOT found!")
+        
+        # If not found (or not Section 3/Supplement B), use standard Section 1 search
+        if not data['work_auth_expiry_found']:
+            logger.info(f"[BUCKET 4 DEBUG] ⚠️ Entering FALLBACK logic (standard Section 1 search)")
+            
+            # First, check if employee is a US Citizen - they don't need work authorization
+            is_us_citizen = False
+            for page in pages:
+                extracted = page.get('extracted_values', {})
+                citizenship = extracted.get('citizenship_status') or extracted.get('employee_citizenship_status')
+                if citizenship:
+                    citizenship_lower = str(citizenship).lower()
+                    if any(term in citizenship_lower for term in ['citizen of the united states', 'us citizen', 'citizen']) and 'non' not in citizenship_lower:
+                        is_us_citizen = True
+                        logger.info(f"[BUCKET 4 DEBUG] FALLBACK: Employee is US Citizen - skipping work auth extraction")
+                        break
+            
+            if not is_us_citizen:
+                for page in pages:
+                    page_title = page.get('page_title', '').lower()
+                    extracted = page.get('extracted_values', {})
+                    
+                    if 'section 1' in page_title or 'employment eligibility' in page_title:
+                        logger.info(f"[BUCKET 4 DEBUG] FALLBACK: Checking {page.get('page_title')}")
+                        # Use fuzzy matching for work auth fields
+                        work_auth = self._get_field_fuzzy(extracted, [
+                            'work_authorization_expiration_date',
+                            'work_auth_expiration_date',
+                            'work_until_date',
+                            'alien_authorized_to_work_until',
+                            'alien_authorized_to_work_until_date',
+                            'alien_expiration_date',
+                            'work_auth_expiry_date',
+                            'authorization_expiration_date'
+                        ])
+                        
+                        work_auth_fields = [work_auth] if work_auth else []
+                        
+                        logger.info(f"[BUCKET 4 DEBUG] FALLBACK: work_auth from fuzzy: '{work_auth}'")
                         
                         for work_auth in work_auth_fields:
                             if work_auth and work_auth not in ['N/A', '', None]:
                                 data['work_auth_expiry_date'] = str(work_auth)
                                 data['work_auth_expiry_found'] = True
                                 score += 8  # Work Auth Expiry Date Found
+                                logger.info(f"[BUCKET 4 DEBUG] FALLBACK: ✅ Set work_auth_expiry_date to: {work_auth}")
                                 break
                         
                         if data['work_auth_expiry_found']:
                             break
         
-        # If not found (or not Section 3), use standard Section 1 search
-        if not data['work_auth_expiry_found']:
-            for page in pages:
-                page_title = page.get('page_title', '').lower()
-                extracted = page.get('extracted_values', {})
-                
-                if 'section 1' in page_title or 'employment eligibility' in page_title:
-                    work_auth_fields = [
-                        extracted.get('work_auth_expiration_date'),
-                        extracted.get('work_until_date'),
-                        extracted.get('work_authorization_expiration_date'),
-                        extracted.get('alien_authorized_to_work_until'),
-                        extracted.get('alien_authorized_to_work_until_date'),
-                        extracted.get('alien_expiration_date')
-                    ]
-                    
-                    for work_auth in work_auth_fields:
-                        if work_auth and work_auth not in ['N/A', '', None]:
-                            data['work_auth_expiry_date'] = str(work_auth)
-                            data['work_auth_expiry_found'] = True
-                            score += 8  # Work Auth Expiry Date Found
-                            break
-                    
-                    if data['work_auth_expiry_found']:
-                        break
+        logger.info(f"[BUCKET 4 DEBUG] FINAL work_auth_expiry_date: '{data['work_auth_expiry_date']}'")
+        logger.info(f"[BUCKET 4 DEBUG] FINAL work_auth_expiry_found: {data['work_auth_expiry_found']}")
         
         # Find document expiry from appropriate sections
-        form_type = bucket_3_data.get('form_type_detected', 'NONE')
+        # Use fuzzy matching for bucket field
+        form_type = self._get_field_fuzzy(bucket_3_data, [
+            'selected_form_type',
+            'form_type_selected',
+            'form_type',
+            'type_selected'
+        ], default='new_hire')
+        
         is_supplement_b = 'supplement' in form_type.lower() or 'rehire' in form_type.lower()
         is_section_3_doc = 'reverification' in form_type.lower() or 'section_3' in form_type.lower() or 'section 3' in form_type.lower()
         
@@ -737,18 +875,29 @@ class I9RubricProcessor:
             doc_expiry = None
             
             if is_supplement_b and 'supplement b' in page_title:
-                doc_expiry = extracted.get('reverification_1_expiration_date')
+                doc_expiry = self._get_field_fuzzy(extracted, [
+                    'reverification_1_expiration_date',
+                    'reverification_expiration_date',
+                    'expiration_date'
+                ])
             elif is_section_3_doc and ('section 3' in page_title or 'reverification' in page_title):
-                doc_expiry = (extracted.get('reverification_expiration_date') or 
-                            extracted.get('section_3_expiration_date'))
+                doc_expiry = self._get_field_fuzzy(extracted, [
+                    'reverification_expiration_date',
+                    'section_3_expiration_date',
+                    'expiration_date',
+                    'document_expiration_date'
+                ])
             elif 'section 2' in page_title:
-                doc_expiry = (extracted.get('list_a_expiration_date') or 
-                            extracted.get('list_b_expiration_date') or 
-                            extracted.get('list_c_expiration_date') or
-                            # De Lima format variations
-                            extracted.get('list_a_document_1_expiration_date') or
-                            extracted.get('list_a_document_2_expiration_date') or
-                            extracted.get('list_a_document_3_expiration_date'))
+                doc_expiry = self._get_field_fuzzy(extracted, [
+                    'list_a_expiration_date',
+                    'list_b_expiration_date',
+                    'list_c_expiration_date',
+                    'list_a_document_1_expiration_date',
+                    'list_a_document_2_expiration_date',
+                    'list_a_document_3_expiration_date',
+                    'document_expiration_date',
+                    'expiration_date'
+                ])
             
             if doc_expiry and doc_expiry not in ['N/A', '', None]:
                 data['document_expiry_date'] = str(doc_expiry)
@@ -804,7 +953,15 @@ class I9RubricProcessor:
         }
         
         pages = catalog_data.get('document_catalog', {}).get('pages', catalog_data.get('pages', []))
-        form_type = bucket_3_data.get('form_type_detected', 'NONE')
+        
+        # Use fuzzy matching for bucket field
+        form_type = self._get_field_fuzzy(bucket_3_data, [
+            'selected_form_type',
+            'form_type_selected',
+            'form_type_detected',
+            'form_type',
+            'type'
+        ], default='NONE')
         
         documents = []
         
@@ -880,13 +1037,21 @@ class I9RubricProcessor:
         logger.info(f"Bucket 5 (Document Tracking): {score}/15 points")
         return score, data
     
-    def _extract_comprehensive_business_fields(self, catalog_data: Dict, bucket_2_data: Dict, bucket_3_data: Dict) -> Dict:
+    def _extract_comprehensive_business_fields(self, catalog_data: Dict, bucket_2_data: Dict, bucket_3_data: Dict, bucket_4_data: Dict = None) -> Dict:
         """
         Extract comprehensive business fields for CSV output
         """
         pages = catalog_data.get('document_catalog', {}).get('pages', catalog_data.get('pages', []))
         
         # Initialize business fields
+        # Use bucket_4 results for work authorization if available
+        work_auth_from_bucket4 = ''
+        work_auth_source = ''
+        if bucket_4_data:
+            work_auth_from_bucket4 = bucket_4_data.get('work_auth_expiry_date', '')
+            if work_auth_from_bucket4:
+                work_auth_source = 'Section 1'
+        
         business_fields = {
             # Personal Information
             'employee_first_name': '',
@@ -898,22 +1063,22 @@ class I9RubricProcessor:
             
             # Form Classification (Business Fields) - Use validated form type from business rules
             'form_type_detected': self._get_validated_form_type(bucket_2_data, bucket_3_data),
-            'form_type_decision_basis': bucket_3_data.get('form_type_decision_basis', ''),
-            'form_type_source_page': bucket_3_data.get('form_type_source_page', ''),
+            'form_type_decision_basis': self._get_field_fuzzy(bucket_3_data, ['form_type_decision_basis', 'decision_basis', 'form_decision'], ''),
+            'form_type_source_page': self._get_field_fuzzy(bucket_3_data, ['form_type_source_page', 'source_page', 'form_source'], ''),
             'total_i9_sets_found': 0,
-            'section_1_pages_count': bucket_2_data.get('section_1_pages_found', 0),
-            'section_2_pages_count': bucket_2_data.get('section_2_pages_found', 0),
-            'section_3_pages_count': bucket_3_data.get('section_3_pages_count', 0),
-            'supplement_b_pages_count': bucket_3_data.get('supplement_b_pages_count', 0),
+            'section_1_pages_count': self._get_field_fuzzy(bucket_2_data, ['section_1_pages_found', 'section_1_count', 'section_1_pages'], 0),
+            'section_2_pages_count': self._get_field_fuzzy(bucket_2_data, ['section_2_pages_found', 'section_2_count', 'section_2_pages'], 0),
+            'section_3_pages_count': self._get_field_fuzzy(bucket_3_data, ['section_3_pages_count', 'section_3_count', 'section_3_pages'], 0),
+            'supplement_b_pages_count': self._get_field_fuzzy(bucket_3_data, ['supplement_b_pages_count', 'supplement_b_count', 'supplement_pages'], 0),
             
             # Primary I-9 Set Information
-            'primary_i9_set_signature_date': bucket_3_data.get('selected_form_signature_date', ''),
-            'primary_i9_set_type': bucket_2_data.get('form_type_detected', 'NONE'),
+            'primary_i9_set_signature_date': self._get_field_fuzzy(bucket_3_data, ['selected_form_signature_date', 'form_signature_date', 'signature_date'], ''),
+            'primary_i9_set_type': self._get_field_fuzzy(bucket_2_data, ['form_type_detected', 'form_type', 'type_detected'], 'NONE'),
             'primary_i9_set_pages': '',
             
-            # Work Authorization
-            'work_authorization_expiry_date': '',
-            'work_authorization_source': '',
+            # Work Authorization - Use bucket_4 results
+            'work_authorization_expiry_date': work_auth_from_bucket4,
+            'work_authorization_source': work_auth_source,
             
             # Document Information
             'documents_in_primary_set': '',
@@ -928,7 +1093,7 @@ class I9RubricProcessor:
             
             # Additional Fields
             'employee_signature_date': '',
-            'employer_signature_date': bucket_3_data.get('selected_form_signature_date', ''),
+            'employer_signature_date': self._get_field_fuzzy(bucket_3_data, ['selected_form_signature_date', 'employer_signature_date', 'signature_date'], ''),
             'alien_registration_number': '',
             'first_day_of_employment': '',
             
@@ -989,24 +1154,10 @@ class I9RubricProcessor:
                         else:
                             business_fields['citizenship_status'] = str(citizenship)
                 
-                # Work Authorization - collect all dates and find the latest
-                work_auth_fields = [
-                    extracted.get('work_auth_expiration_date'),
-                    extracted.get('work_until_date'),
-                    extracted.get('work_authorization_expiration_date'),
-                    extracted.get('alien_authorized_to_work_until'),
-                    extracted.get('alien_authorized_to_work_until_date'),
-                    extracted.get('alien_expiration_date'),
-                    extracted.get('section2_list_a_expiration_date'),
-                    extracted.get('reverification_expiration_date')
-                ]
-                
-                for work_auth in work_auth_fields:
-                    if work_auth and work_auth not in ['N/A', '', None]:
-                        # Convert to comparable format and check if it's later than current
-                        if self._is_later_date(str(work_auth), business_fields['work_authorization_expiry_date']):
-                            business_fields['work_authorization_expiry_date'] = str(work_auth)
-                            business_fields['work_authorization_source'] = 'Section 1'
+                # Work Authorization - REMOVED: Now using bucket_4 results instead
+                # This was causing incorrect data by re-extracting and overwriting bucket_4's correct results
+                # The old code was extracting from ALL pages including reverification_expiration_date
+                # which gave wrong dates for Section 3 cases
                 
                 # Employee Signature Date
                 if not business_fields['employee_signature_date']:
@@ -1103,19 +1254,25 @@ class I9RubricProcessor:
         # Find the primary (latest) I-9 set
         # CRITICAL: Use bucket_3 selection if available (it uses proper business rules)
         # Only fall back to max date if bucket_3 didn't select anything
-        if bucket_3_data.get('selected_form_signature_date'):
+        selected_sig_date = self._get_field_fuzzy(bucket_3_data, [
+            'selected_form_signature_date',
+            'form_signature_date',
+            'signature_date_selected',
+            'signature_date'
+        ])
+        
+        if selected_sig_date:
             # Use bucket 3's selection (it already applied business rules and validation)
-            business_fields['primary_i9_set_signature_date'] = bucket_3_data.get('selected_form_signature_date')
+            business_fields['primary_i9_set_signature_date'] = selected_sig_date
             # Find the corresponding set info
-            selected_date = bucket_3_data.get('selected_form_signature_date')
-            if selected_date in i9_sets:
-                primary_set = i9_sets[selected_date]
+            if selected_sig_date in i9_sets:
+                primary_set = i9_sets[selected_sig_date]
                 business_fields['primary_i9_set_type'] = primary_set['type']
                 business_fields['primary_i9_set_pages'] = ' | '.join(set(primary_set['pages']))
             else:
                 # Set info not found, use bucket 3 data
-                business_fields['primary_i9_set_type'] = bucket_3_data.get('selected_form_type', 'NONE')
-                business_fields['primary_i9_set_pages'] = bucket_3_data.get('form_type_source_page', '')
+                business_fields['primary_i9_set_type'] = self._get_field_fuzzy(bucket_3_data, ['selected_form_type', 'form_type'], 'NONE')
+                business_fields['primary_i9_set_pages'] = self._get_field_fuzzy(bucket_3_data, ['form_type_source_page', 'source_page'], '')
         elif i9_sets:
             # Fallback: find latest using proper date comparison
             latest_date = max(i9_sets.keys(), key=lambda d: self._parse_date_for_comparison(d))
@@ -1132,39 +1289,66 @@ class I9RubricProcessor:
         form_type = business_fields['form_type_detected']
         documents = []
         
+        logger.info(f"[DOCUMENT EXTRACTION DEBUG] form_type_detected: '{form_type}'")
+        
         # For Section 3 and Supplement B, we need to extract ONLY from the LATEST page
         # Build a list of pages to extract from based on form type
-        # Use flexible matching for form types
-        is_section_3_form = 'reverification' in form_type.lower() or 'section_3' in form_type.lower() or 'section 3' in form_type.lower()
-        is_supplement_b_form = 'supplement' in form_type.lower() or 'rehire' in form_type.lower()
+        # Use flexible matching for form types (remove hyphens for matching)
+        form_type_normalized = form_type.lower().replace('-', '').replace('_', '')
+        is_section_3_form = 'reverification' in form_type_normalized or 'section3' in form_type_normalized or 'section 3' in form_type.lower()
+        is_supplement_b_form = 'supplement' in form_type.lower() or 'rehire' in form_type_normalized
+        
+        logger.info(f"[DOCUMENT EXTRACTION DEBUG] is_section_3_form: {is_section_3_form}, is_supplement_b_form: {is_supplement_b_form}")
         
         pages_to_extract = []
         
         if is_section_3_form:
             # Find all Section 3 pages with signature dates
+            logger.info(f"[SECTION 3 DEBUG] Searching through {len(pages)} pages for Section 3")
             section3_pages = []
             for page in pages:
                 page_title = page.get('page_title', '').lower()
                 extracted = page.get('extracted_values', {})
-                if 'section 3' in page_title or 'reverification' in page_title:
+                logger.info(f"[SECTION 3 DEBUG] Checking page {page.get('page_number')}: '{page.get('page_title')}'")
+                # Match Section 3 pages: "Section 3", "Sections 2 & 3", "reverification", or has reverification fields
+                is_section_3_page = ('section 3' in page_title or 
+                                    'sections 2 & 3' in page_title or 
+                                    'sections 2 and 3' in page_title or
+                                    'reverification' in page_title or
+                                    any('reverif' in k.lower() for k in extracted.keys()))
+                if is_section_3_page:
+                    logger.info(f"[SECTION 3 DEBUG]   -> Matched as Section 3 page!")
                     # Use fuzzy matching to find signature dates
                     sig_matches = self.fuzzy_matcher.find_signature_fields(extracted)
-                    # Filter to only valid dates (exclude names like "Fatima Yamin")
-                    sig_dates = [sig_date for field_name, sig_date, _ in sig_matches 
-                                if self._is_valid_date_format(str(sig_date)) and '_name' not in field_name.lower()]
+                    logger.info(f"[SECTION 3 DEBUG] Page {page.get('page_number')}: Found {len(sig_matches)} signature matches (before filtering)")
+                    # Filter to only valid dates (exclude names and EXCLUDE expiration dates)
+                    # For Section 3, we want SIGNATURE dates, not EXPIRATION dates
+                    sig_dates = [(field_name, sig_date) for field_name, sig_date, _ in sig_matches 
+                                if self._is_valid_date_format(str(sig_date)) 
+                                and '_name' not in field_name.lower()
+                                and 'expiration' not in field_name.lower()  # Exclude expiration dates
+                                and 'expiry' not in field_name.lower()]      # Exclude expiry dates
+                    logger.info(f"[SECTION 3 DEBUG] Page {page.get('page_number')}: {len(sig_dates)} valid signature dates after filtering")
                     latest_sig = None
-                    for sig_date in sig_dates:
+                    for field_name, sig_date in sig_dates:
                         if sig_date and sig_date not in ['N/A', '', None]:
                             if not latest_sig or self._parse_date_for_comparison(sig_date) > self._parse_date_for_comparison(latest_sig):
                                 latest_sig = sig_date
+                                logger.info(f"[SECTION 3 DEBUG] Page {page.get('page_number')}: Using {field_name} = {sig_date}")
                     
                     if latest_sig:
                         section3_pages.append({'page': page, 'signature_date': latest_sig})
+                        logger.info(f"[SECTION 3 DEBUG] Page {page.get('page_number')}: signature = {latest_sig}")
             
-            # Select ONLY the page with the latest signature date
+            # Select ALL pages with the latest signature date (there may be multiple pages for the same Section 3 set)
             if section3_pages:
-                latest_section3 = max(section3_pages, key=lambda x: self._parse_date_for_comparison(x['signature_date']))
-                pages_to_extract = [latest_section3['page']]
+                latest_sig_date = max(section3_pages, key=lambda x: self._parse_date_for_comparison(x['signature_date']))['signature_date']
+                logger.info(f"[SECTION 3 DEBUG] Latest signature date: {latest_sig_date}")
+                # Get ALL pages with this latest signature date
+                pages_to_extract = [p['page'] for p in section3_pages if p['signature_date'] == latest_sig_date]
+                logger.info(f"[SECTION 3 DEBUG] Extracting from {len(pages_to_extract)} pages with signature {latest_sig_date}")
+                for p in pages_to_extract:
+                    logger.info(f"[SECTION 3 DEBUG]   - Page {p.get('page_number')}: {p.get('page_title')}")
         
         elif is_supplement_b_form:
             # Find all Supplement B pages with signature dates
@@ -1200,9 +1384,12 @@ class I9RubricProcessor:
                     pages_to_extract.append(page)
         
         # Now extract documents from the selected pages
-        for page in pages_to_extract:
+        logger.info(f"[DOCUMENT EXTRACTION DEBUG] Extracting from {len(pages_to_extract)} pages")
+        for idx, page in enumerate(pages_to_extract, 1):
             page_title = page.get('page_title', '').lower()
+            page_num = page.get('page_number', 'Unknown')
             extracted = page.get('extracted_values', {})
+            logger.info(f"[DOCUMENT EXTRACTION DEBUG] Page {idx}/{len(pages_to_extract)}: Page {page_num} - {page.get('page_title')}")
             
             # Comprehensive document field variations found in analysis
             # Use fuzzy matching to find ALL document title fields
@@ -1217,6 +1404,7 @@ class I9RubricProcessor:
             
             for field_name, doc_title, confidence in doc_matches:
                 if doc_title and doc_title not in ['N/A', '', None]:
+                    logger.info(f"[DOCUMENT EXTRACTION DEBUG]   Found document: {doc_title[:50]}... (field: {field_name})")
                     # Try to find corresponding document number using fuzzy matching
                     # Look for fields that are similar to the title field but with 'number' instead
                     doc_number = ''
@@ -1239,6 +1427,8 @@ class I9RubricProcessor:
                         documents.append(f"{doc_title} (#{doc_number})")
                     else:
                         documents.append(doc_title)
+        
+        logger.info(f"[DOCUMENT EXTRACTION DEBUG] Total documents extracted: {len(documents)}")
         
         business_fields['documents_in_primary_set'] = ' | '.join(documents)
         business_fields['document_count_in_primary_set'] = len(documents)
@@ -1520,7 +1710,13 @@ class I9RubricProcessor:
         Get the validated form type based on business rules validation
         """
         # Use the selected form type from bucket 3 business rules which has proper validation
-        selected_form_type = bucket_3_data.get('selected_form_type', 'new_hire')
+        # Use fuzzy matching for bucket field
+        selected_form_type = self._get_field_fuzzy(bucket_3_data, [
+            'selected_form_type',
+            'form_type_selected',
+            'form_type',
+            'type'
+        ], default='new_hire')
         
         # Map internal codes to user-friendly names
         type_mapping = {

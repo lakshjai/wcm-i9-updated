@@ -27,7 +27,17 @@ class FuzzyFieldMatcher:
         'date_signed',
         'reverification_date_signed',
         'section_3_signature_date',
-        'supplement_b_signature_date'
+        'supplement_b_signature_date',
+        # Wu, Qianyi variations
+        'section_3_employer_signature_date',
+        'employer_signature_date_section_3',
+        'reverification_employer_signature_date',
+        'employer_signature_date_reverification',
+        'signature_date_section_3',
+        'reverification_signature',
+        'employer_reverification_signature_date',
+        'section_3_date_signed',
+        'date_signed_section_3'
     ]
     
     DOCUMENT_TITLE_PATTERNS = [
@@ -61,6 +71,101 @@ class FuzzyFieldMatcher:
         'middle_name': ['middle_name', 'employee_middle_name', 'middle_initial', 'middle', 'mname', 'mi']
     }
     
+    # SSN patterns
+    SSN_PATTERNS = [
+        'ssn',
+        'social_security_number',
+        'employee_ssn',
+        'us_social_security_number',
+        'employee_social_security_number',
+        'social_security',
+        'ss_number'
+    ]
+    
+    # Date of Birth patterns
+    DOB_PATTERNS = [
+        'date_of_birth',
+        'dob',
+        'employee_date_of_birth',
+        'employee_dob',
+        'birth_date',
+        'birthdate'
+    ]
+    
+    # Address patterns
+    ADDRESS_PATTERNS = {
+        'street': ['street_address', 'address', 'employee_address', 'street', 'address_line_1', 'address_line1'],
+        'apt': ['apt_number', 'apartment_number', 'apt', 'apartment', 'unit', 'suite'],
+        'city': ['city', 'employee_city', 'city_or_town'],
+        'state': ['state', 'employee_state', 'state_province'],
+        'zip': ['zip_code', 'zipcode', 'zip', 'postal_code', 'employee_zip_code']
+    }
+    
+    # Citizenship patterns
+    CITIZENSHIP_PATTERNS = [
+        'citizenship_status',
+        'employee_citizenship_status',
+        'citizenship',
+        'immigration_status',
+        'status'
+    ]
+    
+    # Document number patterns (for List A/B/C documents)
+    DOCUMENT_NUMBER_PATTERNS = [
+        'document_number',
+        'document_no',
+        'number',
+        'issuing_authority',
+        'list_a_document_number',
+        'list_b_document_number',
+        'list_c_document_number',
+        'passport_number',
+        'alien_registration_number',
+        'uscis_number',
+        'i94_admission_number',
+        'form_i94_admission_number',
+        'admission_number',
+        'admission_record_number'
+    ]
+    
+    # I-94 specific patterns
+    I94_PATTERNS = [
+        'form_i94_admission_number',
+        'i94_admission_number',
+        'admission_number',
+        'admission_record_number',
+        'i94_number',
+        'arrival_departure_number'
+    ]
+    
+    # Alien registration patterns
+    ALIEN_REGISTRATION_PATTERNS = [
+        'alien_registration_number',
+        'alien_registration_number_uscis',
+        'uscis_number',
+        'a_number',
+        'alien_number',
+        'registration_number'
+    ]
+    
+    # Foreign passport patterns
+    PASSPORT_PATTERNS = [
+        'foreign_passport_number',
+        'passport_number',
+        'passport_no',
+        'country_of_issuance',
+        'issuing_country'
+    ]
+    
+    # Employment date patterns
+    EMPLOYMENT_DATE_PATTERNS = [
+        'first_day_of_employment',
+        'employment_start_date',
+        'hire_date',
+        'start_date',
+        'date_of_hire'
+    ]
+    
     def __init__(self, similarity_threshold: float = 0.6):
         """
         Initialize fuzzy matcher
@@ -76,6 +181,7 @@ class FuzzyFieldMatcher:
         - Convert to lowercase
         - Replace spaces/hyphens with underscores
         - Remove special characters
+        - Strip numbered suffixes (e.g., _1, _2, _3) for better matching
         """
         if not field_name:
             return ""
@@ -86,7 +192,7 @@ class FuzzyFieldMatcher:
         # Replace spaces and hyphens with underscores
         normalized = re.sub(r'[\s\-]+', '_', normalized)
         
-        # Remove special characters except underscores
+        # Remove special characters except underscores and digits
         normalized = re.sub(r'[^a-z0-9_]', '', normalized)
         
         # Remove multiple consecutive underscores
@@ -94,6 +200,10 @@ class FuzzyFieldMatcher:
         
         # Remove leading/trailing underscores
         normalized = normalized.strip('_')
+        
+        # CRITICAL: Strip numbered suffixes like _1, _2, _3 at the end
+        # This allows employer_signature_date_1 to match employer_signature_date
+        normalized = re.sub(r'_\d+$', '', normalized)
         
         return normalized
     
@@ -215,6 +325,66 @@ class FuzzyFieldMatcher:
         
         return matches
     
+    def find_ssn_field(self, extracted_values: Dict) -> Optional[Tuple[str, str, float]]:
+        """Find SSN field in extracted values"""
+        matches = self.find_fields_by_patterns(extracted_values, self.SSN_PATTERNS)
+        return matches[0] if matches else None
+    
+    def find_dob_field(self, extracted_values: Dict) -> Optional[Tuple[str, str, float]]:
+        """Find date of birth field in extracted values"""
+        matches = self.find_fields_by_patterns(extracted_values, self.DOB_PATTERNS)
+        return matches[0] if matches else None
+    
+    def find_address_field(self, extracted_values: Dict, address_type: str) -> Optional[Tuple[str, str, float]]:
+        """Find address field (street, apt, city, state, zip) in extracted values"""
+        if address_type not in self.ADDRESS_PATTERNS:
+            return None
+        patterns = self.ADDRESS_PATTERNS[address_type]
+        matches = self.find_fields_by_patterns(extracted_values, patterns)
+        return matches[0] if matches else None
+    
+    def find_citizenship_field(self, extracted_values: Dict) -> Optional[Tuple[str, str, float]]:
+        """Find citizenship status field in extracted values"""
+        matches = self.find_fields_by_patterns(extracted_values, self.CITIZENSHIP_PATTERNS)
+        return matches[0] if matches else None
+    
+    def find_i94_field(self, extracted_values: Dict) -> Optional[Tuple[str, str, float]]:
+        """Find I-94 admission number field in extracted values"""
+        matches = self.find_fields_by_patterns(extracted_values, self.I94_PATTERNS)
+        return matches[0] if matches else None
+    
+    def find_alien_registration_field(self, extracted_values: Dict) -> Optional[Tuple[str, str, float]]:
+        """Find alien registration number field in extracted values"""
+        matches = self.find_fields_by_patterns(extracted_values, self.ALIEN_REGISTRATION_PATTERNS)
+        return matches[0] if matches else None
+    
+    def find_passport_number_field(self, extracted_values: Dict) -> Optional[Tuple[str, str, float]]:
+        """Find passport number field in extracted values"""
+        matches = self.find_fields_by_patterns(extracted_values, self.PASSPORT_PATTERNS)
+        return matches[0] if matches else None
+    
+    def find_employment_date_field(self, extracted_values: Dict) -> Optional[Tuple[str, str, float]]:
+        """Find first day of employment field in extracted values"""
+        matches = self.find_fields_by_patterns(extracted_values, self.EMPLOYMENT_DATE_PATTERNS)
+        return matches[0] if matches else None
+    
+    def find_document_number_fields(self, extracted_values: Dict) -> List[Tuple[str, str, float]]:
+        """Find all document number fields in extracted values"""
+        return self.find_fields_by_patterns(extracted_values, self.DOCUMENT_NUMBER_PATTERNS)
+    
+    def find_fields_by_patterns(self, extracted_values: Dict, patterns: List[str]) -> List[Tuple[str, str, float]]:
+        """Generic method to find fields matching a list of patterns"""
+        matches = []
+        for field_name, value in extracted_values.items():
+            if not value or value in ['N/A', '', None]:
+                continue
+            
+            pattern, score = self.find_best_match(field_name, patterns)
+            if pattern:
+                matches.append((field_name, value, score))
+        
+        return matches
+    
     def find_name_field(self, extracted_values: Dict, name_type: str) -> Optional[Tuple[str, str, float]]:
         """
         Find a specific name field (first_name, last_name, middle_name)
@@ -226,24 +396,8 @@ class FuzzyFieldMatcher:
             return None
         
         patterns = self.NAME_PATTERNS[name_type]
-        best_match = None
-        best_score = 0.0
-        best_field = None
-        
-        for field_name, value in extracted_values.items():
-            if not value or value in ['N/A', '', None]:
-                continue
-            
-            pattern, score = self.find_best_match(field_name, patterns)
-            if pattern and score > best_score:
-                best_score = score
-                best_match = value
-                best_field = field_name
-        
-        if best_match:
-            return (best_field, best_match, best_score)
-        else:
-            return None
+        matches = self.find_fields_by_patterns(extracted_values, patterns)
+        return matches[0] if matches else None
     
     def extract_any_signature_date(self, extracted_values: Dict) -> Optional[Tuple[str, str, float]]:
         """

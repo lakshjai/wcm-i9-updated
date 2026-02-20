@@ -54,8 +54,10 @@ def main():
         catalog_output_dir=catalog_output_dir
     )
     
-    # Get all PDF files
-    pdf_files = sorted(glob(f"{input_dir}/*.pdf"))
+    # Get all PDF files (case-insensitive)
+    pdf_files_lower = glob(f"{input_dir}/*.pdf")
+    pdf_files_upper = glob(f"{input_dir}/*.PDF")
+    pdf_files = sorted(list(set(pdf_files_lower + pdf_files_upper)))
     logger.info(f"Found {len(pdf_files)} PDF files to process")
     
     if not pdf_files:

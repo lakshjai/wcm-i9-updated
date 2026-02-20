@@ -57,9 +57,15 @@ def setup_directories():
 
 
 def get_pdf_files() -> List[Path]:
-    """Get list of PDF files from input folder."""
-    pdf_files = list(config.INPUT_FOLDER.glob("*.pdf"))
-    return sorted(pdf_files)
+    """Get list of PDF files from input folder (case-insensitive)."""
+    # Get both lowercase and uppercase PDF extensions
+    pdf_files_lower = list(config.INPUT_FOLDER.glob("*.pdf"))
+    pdf_files_upper = list(config.INPUT_FOLDER.glob("*.PDF"))
+    
+    # Combine and remove duplicates (in case filesystem is case-insensitive)
+    all_pdf_files = list(set(pdf_files_lower + pdf_files_upper))
+    
+    return sorted(all_pdf_files)
 
 
 def get_catalog_files() -> List[Path]:
