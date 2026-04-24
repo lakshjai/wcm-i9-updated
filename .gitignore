@@ -11,6 +11,13 @@ input/*
 *.log.*
 bkup/*
 
+workdir/*
+debug_scripts/*
+docs/*
+taxonomy_pipeline/*
+.kiro/*
+.windsurf/*
+
 # Python
 __pycache__/
 *.py[cod]
@@ -37,7 +44,7 @@ share/python-wheels/
 MANIFEST
 
 # Virtual Environments
-.env
+# .env
 .venv
 env/
 venv/

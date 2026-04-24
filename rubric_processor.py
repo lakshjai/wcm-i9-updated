@@ -1170,6 +1170,17 @@ class I9RubricProcessor:
                     alien_reg = (extracted.get('alien_registration_number') or extracted.get('uscis_a_number'))
                     if alien_reg and alien_reg not in ['N/A', '', None]:
                         business_fields['alien_registration_number'] = str(alien_reg)
+                
+                # First Day of Employment (from Section 2)
+                if not business_fields['first_day_of_employment']:
+                    first_day = (extracted.get('first_day_of_employment') or 
+                                extracted.get('employee_first_day_of_employment') or
+                                extracted.get('section_2_employee_first_day_of_employment') or
+                                extracted.get('section_2_first_day_of_employment') or
+                                extracted.get('first_day_employment') or
+                                extracted.get('hire_date'))
+                    if first_day and first_day not in ['N/A', '', None, 'null']:
+                        business_fields['first_day_of_employment'] = str(first_day)
         
         # Enhanced I-9 set detection - group pages by signature dates and form sets
         i9_sets = {}  # signature_date -> {pages: [], type: '', documents: []}
